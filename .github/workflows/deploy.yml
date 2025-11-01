@@ -1,0 +1,48 @@
+name: Deploy Trading Bot to Server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install SSHpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Copy files to server using password
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no -r . ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/trading-bot/
+
+      - name: Run deployment script on server
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          cd /root/trading-bot
+          
+          # Создаем виртуальное окружение
+          python3 -m venv venv
+          source venv/bin/activate
+          
+          # Устанавливаем зависимости
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          
+          # Копируем .env файл если его нет
+          if [ ! -f .env ]; then
+            echo "⚠️  .env file not found, please create it manually"
+          fi
+          
+          # Перезапускаем бота через PM2
+          pm2 delete trading-bot 2>/dev/null || true
+          pm2 start main.py --name "trading-bot" --interpreter venv/bin/python
+          pm2 save
+          pm2 startup
+          
+          echo "🚀 Trading bot deployed successfully!"
+          EOF
