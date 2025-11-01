@@ -1,4 +1,4 @@
-name: Deploy Trading Bot to Server
+name: Deploy Trading Bot
 
 on:
   push:
@@ -16,33 +16,51 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sshpass
 
-      - name: Copy files to server using password
+      - name: Test server connection
         run: |
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no -r . ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/trading-bot/
+          echo "🔍 Testing server connection..."
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "pwd && whoami && mkdir -p trading-bot"
 
-      - name: Run deployment script on server
+      - name: Deploy application
         run: |
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-          cd /root/trading-bot
+          set -e
+          echo "📦 Starting deployment..."
           
-          # Создаем виртуальное окружение
-          python3 -m venv venv
+          # Создаем временный скрипт для деплоя
+          cat > deploy.sh << 'SCRIPT'
+          set -e
+          
+          echo "🔄 Updating code in ~/trading-bot..."
+          cd ~/trading-bot
+          ls -la
+          
+          echo "🐍 Setting up Python environment..."
+          python3 -m venv venv --clear
           source venv/bin/activate
           
-          # Устанавливаем зависимости
+          echo "📚 Installing dependencies..."
           pip install --upgrade pip
           pip install -r requirements.txt
           
-          # Копируем .env файл если его нет
-          if [ ! -f .env ]; then
-            echo "⚠️  .env file not found, please create it manually"
-          fi
-          
-          # Перезапускаем бота через PM2
+          echo "🔧 (Re)starting bot..."
+          # Удаляем старый процесс если есть, запускаем новый
           pm2 delete trading-bot 2>/dev/null || true
           pm2 start main.py --name "trading-bot" --interpreter venv/bin/python
           pm2 save
-          pm2 startup
           
-          echo "🚀 Trading bot deployed successfully!"
-          EOF
+          echo "✅ Deployment completed successfully!"
+          echo "📊 Bot status:"
+          pm2 status
+          SCRIPT
+          
+          # Копируем файлы проекта
+          echo "📤 Copying project files..."
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no -r . ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:trading-bot/
+          
+          # Копируем и выполняем скрипт деплоя
+          echo "🚀 Running deployment script..."
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no deploy.sh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:trading-bot/
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "cd trading-bot && chmod +x deploy.sh && ./deploy.sh"
+
+      - name: Cleanup
+        run: rm -f deploy.sh
