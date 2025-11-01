@@ -12,41 +12,43 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install SSHpass
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sshpass
+        run: sudo apt-get install -y sshpass
 
-      - name: Test server connection
-        run: |
-          echo "🔍 Testing server connection..."
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "pwd && whoami && mkdir -p trading-bot"
-
-      - name: Deploy application
+      - name: Deploy to server
         run: |
           set -e
           echo "📦 Starting deployment..."
           
           # Создаем временный скрипт для деплоя
           cat > deploy.sh << 'SCRIPT'
+          #!/bin/bash
           set -e
           
           echo "🔄 Updating code in ~/trading-bot..."
           cd ~/trading-bot
-          ls -la
+          
+          echo "🔧 Installing system dependencies..."
+          sudo apt update
+          sudo apt install -y python3-venv python3-pip
           
           echo "🐍 Setting up Python environment..."
           python3 -m venv venv --clear
           source venv/bin/activate
           
-          echo "📚 Installing dependencies..."
+          echo "📚 Installing Python dependencies..."
           pip install --upgrade pip
           pip install -r requirements.txt
           
-          echo "🔧 (Re)starting bot..."
-          # Удаляем старый процесс если есть, запускаем новый
+          echo "🔧 Installing PM2 if not present..."
+          if ! command -v pm2 &> /dev/null; then
+            sudo npm install -g pm2
+          fi
+          
+          echo "🚀 (Re)starting bot..."
           pm2 delete trading-bot 2>/dev/null || true
           pm2 start main.py --name "trading-bot" --interpreter venv/bin/python
           pm2 save
+          pm2 startup
           
           echo "✅ Deployment completed successfully!"
           echo "📊 Bot status:"
