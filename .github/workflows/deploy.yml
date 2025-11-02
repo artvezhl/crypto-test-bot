@@ -32,26 +32,82 @@ jobs:
       - name: Run basic syntax checks
         run: |
           echo "🔍 Running syntax checks..."
-          python -m py_compile src/*.py config.py main.py
+          echo "📁 Project structure:"
+          find . -name "*.py" -not -path "*/__pycache__/*" -not -path "./.git/*" | head -20
+          
+          # Компилируем все Python файлы в правильных директориях
+          find src -name "*.py" -not -path "*/__pycache__/*" -exec python -m py_compile {} \;
+          
+          # Проверяем main.py если он существует
+          if [ -f "main.py" ]; then
+            python -m py_compile main.py
+          fi
+          
           echo "✅ Syntax checks passed"
 
-      - name: Run tests
+      - name: Run import tests
         run: |
-          echo "🧪 Running tests..."
-          # Создаем простые тесты если их нет
-          if [ -f "test_imports.py" ]; then
-            python test_imports.py
+          echo "🧪 Testing imports..."
+          export PYTHONPATH=src:$PYTHONPATH
+          
+          # Тестируем импорты из новой структуры
+          python -c "
+          try:
+              from config import Config
+              print('✅ Config import successful')
+          except ImportError as e:
+              print(f'❌ Config import failed: {e}')
+              exit(1)
+              
+          try:
+              from database import Database
+              print('✅ Database import successful')
+          except ImportError as e:
+              print(f'❌ Database import failed: {e}')
+              exit(1)
+              
+          try:
+              from trading_strategy import TradingBot
+              print('✅ TradingBot import successful')
+          except ImportError as e:
+              print(f'❌ TradingBot import failed: {e}')
+              exit(1)
+              
+          try:
+              from bybit_client import BybitClient
+              print('✅ BybitClient import successful')
+          except ImportError as e:
+              print(f'❌ BybitClient import failed: {e}')
+              exit(1)
+              
+          print('🎉 All imports successful!')
+          "
+
+      - name: Validate project structure
+        run: |
+          echo "📋 Validating project structure..."
+          
+          # Проверяем обязательные файлы
+          REQUIRED_FILES=("src/config/__init__.py" "src/database.py" "src/trading_strategy.py" "src/bybit_client.py")
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ $file exists"
+            else
+              echo "❌ $file missing"
+              exit 1
+            fi
+          done
+          
+          # Проверяем main.py или альтернативную точку входа
+          if [ -f "main.py" ] || [ -f "src/main.py" ] || [ -f "src/__main__.py" ]; then
+            echo "✅ Entry point exists"
           else
-            python -c "
-            try:
-                from config import Config
-                from database import Database
-                print('✅ All imports successful')
-            except Exception as e:
-                print(f'❌ Import error: {e}')
-                exit(1)
-            "
+            echo "❌ No main entry point found (main.py, src/main.py, or src/__main__.py)"
+            exit 1
           fi
+          
+          echo "✅ Project structure validated"
 
   build-and-push:
     needs: test
@@ -98,6 +154,7 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
+  # Остальные jobs остаются без изменений...
   security-scan:
     needs: build-and-push
     runs-on: ubuntu-latest
