@@ -1,0 +1,8 @@
+pybit==5.12.0
+python-dotenv==1.0.0
+requests==2.32.5
+pandas==2.2.2
+numpy==1.26.4
+python-telegram-bot==20.7
+schedule==1.2.0
+pytz==2023.3  # Добавляем для работы с часовыми поясами

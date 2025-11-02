@@ -1,0 +1,70 @@
+name: Deploy Trading Bot
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install SSHpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Deploy to server
+        run: |
+          set -e
+          echo "📦 Starting deployment..."
+          
+          # Создаем временный скрипт для деплоя
+          cat > deploy.sh << 'SCRIPT'
+          #!/bin/bash
+          set -e
+          
+          echo "🔄 Updating code in ~/trading-bot..."
+          cd ~/trading-bot
+          
+          echo "🔧 Installing system dependencies..."
+          sudo apt update
+          sudo apt install -y python3-venv python3-pip build-essential python3-dev libatlas-base-dev
+          
+          echo "🐍 Setting up Python environment..."
+          python3 -m venv venv --clear
+          source venv/bin/activate
+          
+          echo "📚 Installing Python dependencies (with binary wheels)..."
+          pip install --upgrade pip
+          pip install --timeout 60 --no-cache-dir -r requirements.txt
+          
+          echo "🔧 Installing PM2 if not present..."
+          if ! command -v pm2 &> /dev/null; then
+            curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+            sudo apt install -y nodejs
+            sudo npm install -g pm2
+          fi
+          
+          echo "🚀 (Re)starting bot..."
+          pm2 delete trading-bot 2>/dev/null || true
+          pm2 start main.py --name "trading-bot" --interpreter venv/bin/python
+          pm2 save
+          pm2 startup
+          
+          echo "✅ Deployment completed successfully!"
+          echo "📊 Bot status:"
+          pm2 status
+          SCRIPT
+          
+          # Копируем файлы проекта
+          echo "📤 Copying project files..."
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no -r . ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:trading-bot/
+          
+          # Копируем и выполняем скрипт деплоя
+          echo "🚀 Running deployment script..."
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" scp -o StrictHostKeyChecking=no deploy.sh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:trading-bot/
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "cd trading-bot && chmod +x deploy.sh && timeout 300 ./deploy.sh"
+
+      - name: Cleanup
+        run: rm -f deploy.sh
