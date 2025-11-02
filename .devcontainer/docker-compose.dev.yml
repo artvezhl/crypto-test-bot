@@ -1,0 +1,32 @@
+services:
+  trading-bot:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: sleep infinity
+    environment:
+      - DATABASE_URL=postgresql://trader:password@postgres:5432/trading_bot
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=trading_bot
+      - POSTGRES_USER=trader
+      - POSTGRES_PASSWORD=password
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: trading_bot
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d  # Монтируем директорию с SQL-скриптами
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres-data:

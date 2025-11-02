@@ -1,6 +1,8 @@
 {
     "name": "Crypto Trading Bot",
-    "image": "python:3.11-slim",
+    "dockerComposeFile": "docker-compose.dev.yml",
+    "service": "trading-bot",
+    "workspaceFolder": "/app",
     "features": {
         "ghcr.io/devcontainers/features/common-utils:2": {
             "username": "vscode",
@@ -15,15 +17,34 @@
                 "ms-python.python",
                 "ms-python.vscode-pylance",
                 "ms-python.autopep8",
-                "matangover.mypy"
+                "matangover.mypy",
+                "mtxr.sqltools",
+                "mtxr.sqltools-driver-pg",
+                "cweijan.vscode-mysql-client2"
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/usr/local/bin/python",
                 "python.linting.enabled": true,
-                "python.linting.mypyEnabled": true
+                "python.linting.mypyEnabled": true,
+                "python.analysis.extraPaths": [
+                    "/app/src"
+                ],
+                "sqltools.connections": [
+                    {
+                        "name": "Trading Bot PostgreSQL",
+                        "driver": "PostgreSQL",
+                        "previewLimit": 50,
+                        "server": "localhost",
+                        "port": 5432,
+                        "database": "trading_bot",
+                        "username": "trader",
+                        "password": "password"
+                    }
+                ]
             }
         }
     },
-    "postCreateCommand": "pip install -r requirements.txt",
+    "postCreateCommand": "mkdir -p logs backups && pip install -r requirements.txt",
+    "postStartCommand": "echo 'PostgreSQL and Trading Bot are ready'",
     "remoteUser": "vscode"
 }

@@ -1,80 +1,217 @@
 import pytz
 from deepseek_client import DeepSeekClient
 from bybit_client import BybitClient
+from database import Database
 from config import Config
 import time
 import logging
 import json
 from datetime import datetime
+from typing import Dict, List, Optional
+import threading
 
 
 class TradingBot:
     def __init__(self):
         self.deepseek = DeepSeekClient()
         self.bybit = BybitClient()
-        self.symbol = Config.DEFAULT_SYMBOL
+        self.db = Database()
+
+        # Настройки из базы или конфига
+        self.symbol = self.db.get_setting('symbol', Config.DEFAULT_SYMBOL)
+        self.leverage = int(self.db.get_setting('leverage', '10'))
         self.min_confidence = Config.MIN_CONFIDENCE
 
         # Настройки риск-менеджмента
         self.risk_percent = Config.RISK_PERCENT
         self.max_position_percent = Config.MAX_POSITION_PERCENT
         self.min_trade_usdt = Config.MIN_TRADE_USDT
+        self.stop_loss_percent = Config.STOP_LOSS_PERCENT
+        self.take_profit_percent = Config.TAKE_PROFIT_PERCENT
 
         # Трекер состояния
-        self.positions = []
         self.balance_info = {}
-
-        # Начальный баланс (захардкоженный)
-        # Добавьте эту переменную в config.py
         self.initial_balance = Config.INITIAL_BALANCE
-        # Для отслеживания максимального баланса
         self.highest_balance = self.initial_balance
-        # Для отслеживания минимального баланса
         self.lowest_balance = self.initial_balance
 
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
+        # Добавляем разрешенных пользователей
+        self._setup_allowed_users()
+
+        # Настраиваем WebSocket обработчики
+        self._setup_websocket_handlers()
+
+        # Запускаем WebSocket
+        self.bybit.start_websocket()
+
         self.logger.info(
-            f"🔧 Инициализирован бот с риск-менеджментом: {self.risk_percent}% риска на сделку")
-        self.logger.info(
-            f"💰 Начальный баланс: {self.initial_balance:.2f} USDT")
+            f"🔧 Инициализирован бот для {self.symbol} с левериджем {self.leverage}x")
+
+    def _setup_allowed_users(self):
+        """Добавление разрешенных пользователей (здесь укажите свои user_id)"""
+        allowed_users = [
+            # Добавьте user_id разрешенных пользователей
+            # Пример: (123456789, "username")
+        ]
+
+        for user_id, username in allowed_users:
+            self.db.add_allowed_user(user_id, username)
+
+    def _setup_websocket_handlers(self):
+        """Настройка обработчиков WebSocket"""
+        self.bybit.add_position_handler(self._handle_position_update)
+        self.bybit.add_order_handler(self._handle_order_update)
+
+    def _handle_position_update(self, position_data: Dict):
+        """Обработка обновлений позиций из WebSocket"""
+        try:
+            symbol = position_data.get('symbol', '')
+            size = float(position_data.get('size', 0))
+            side = position_data.get('side', '')
+            avg_price = float(position_data.get('avgPrice', 0))
+            position_value = float(position_data.get('positionValue', 0))
+            position_status = position_data.get('positionStatus', '')
+            created_time = position_data.get('createdTime', '')
+            updated_time = position_data.get('updatedTime', '')
+
+            self.logger.info(f"🔄 Обновление позиции: {symbol} {side} {size}")
+
+            # Если позиция закрыта (размер = 0), но у нас она есть в базе
+            if size == 0:
+                open_positions = self.db.get_open_positions()
+                for db_position in open_positions:
+                    if db_position['symbol'] == symbol:
+                        # Позиция закрыта на бирже, закрываем в базе
+                        market_data = self.bybit.get_market_data(symbol)
+                        close_price = market_data['price'] if market_data else db_position['current_price']
+
+                        self.db.close_position(db_position['id'], close_price)
+                        self.logger.info(
+                            f"✅ Позиция #{db_position['id']} закрыта через WebSocket")
+
+                        # Отправляем уведомление
+                        self._send_position_closed_notification(
+                            db_position, close_price)
+                        break
+
+            # Обновляем существующие позиции
+            elif size > 0:
+                open_positions = self.db.get_open_positions()
+                for db_position in open_positions:
+                    if db_position['symbol'] == symbol:
+                        # Обновляем текущую цену в базе
+                        self.db.update_position_price(
+                            db_position['id'], avg_price)
+                        break
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обработки обновления позиции: {e}")
+
+    def _handle_order_update(self, order_data: Dict):
+        """Обработка обновлений ордеров из WebSocket"""
+        try:
+            order_id = order_data.get('orderId', '')
+            order_status = order_data.get('orderStatus', '')
+            symbol = order_data.get('symbol', '')
+            side = order_data.get('side', '')
+            order_type = order_data.get('orderType', '')
+            qty = order_data.get('qty', '0')
+            price = order_data.get('price', '0')
+            created_time = order_data.get('createdTime', '')
+
+            self.logger.info(
+                f"🔄 Обновление ордера: {order_id} {order_status} {symbol}")
+
+            # Если ордер исполнен
+            if order_status in ['Filled', 'PartiallyFilled']:
+                market_data = self.bybit.get_market_data(symbol)
+                if market_data:
+                    current_price = market_data['price']
+                    # Можно добавить дополнительную логику обработки исполненных ордеров
+                    self.logger.info(
+                        f"✅ Ордер {order_id} исполнен по цене {current_price}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обработки обновления ордера: {e}")
+
+    def _send_position_closed_notification(self, position: Dict, close_price: float):
+        """Отправка уведомления о закрытии позиции"""
+        try:
+            import requests
+            from config import Config
+
+            token = Config.TELEGRAM_BOT_TOKEN
+            if not token or token == "your_telegram_token":
+                return
+
+            # Рассчитываем PnL
+            pnl = (close_price - position['entry_price']) * position['size']
+            pnl_percent = (
+                (close_price - position['entry_price']) / position['entry_price']) * 100
+
+            # Корректируем PnL для шорт позиций
+            if position['side'] == 'SELL':
+                pnl = -pnl
+                pnl_percent = -pnl_percent
+
+            moscow_time = self._get_moscow_time()
+            pnl_emoji = "📈" if pnl >= 0 else "📉"
+
+            message = f"""
+🔒 *ПОЗИЦИЯ ЗАКРЫТА*
+
+🆔 *ID:* #{position['id']}
+💹 *Символ:* {position['symbol']}
+📊 *Сторона:* {position['side']}
+💵 *Цена входа:* ${position['entry_price']:.2f}
+💰 *Цена выхода:* ${close_price:.2f}
+{pnl_emoji} *P&L:* {pnl:.2f} USDT ({pnl_percent:.2f}%)
+🔢 *Размер:* {position['size']:.4f}
+⚡ *Леверидж:* {position['leverage']}x
+
+⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
+📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
+"""
+
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                'chat_id': Config.TELEGRAM_CHAT_ID,
+                'text': message,
+                'parse_mode': 'Markdown'
+            }
+
+            requests.post(url, json=payload, timeout=10)
+
+        except Exception as e:
+            self.logger.warning(
+                f"Не удалось отправить уведомление о закрытии позиции: {e}")
 
     def update_balance(self):
-        """Обновляем информацию о балансе - пробуем оба метода"""
+        """Обновляем информацию о балансе"""
         try:
-            # Пробуем получить баланс UNIFIED аккаунта
-            unified_balance = self.bybit.get_unified_balance()
+            balance = self.bybit.get_wallet_balance("UNIFIED")
 
-            # Если в UNIFIED нет баланса, пробуем SPOT
-            if unified_balance['total_equity'] <= 0 and unified_balance['usdt_balance'] <= 0:
-                self.logger.info("🔄 UNIFIED баланс пустой, проверяем SPOT...")
-                spot_balance = self.bybit.get_spot_balance()
-
-                if spot_balance['total_equity'] > 0:
-                    self.balance_info = {
-                        'source': 'SPOT',
-                        'total_equity': spot_balance['total_equity'],
-                        'total_available': spot_balance['total_available_balance'],
-                        'usdt_balance': spot_balance['usdt_balance'],
-                        'full_info': spot_balance
-                    }
-                else:
-                    self.balance_info = {
-                        'source': 'UNIFIED',
-                        'total_equity': unified_balance['total_equity'],
-                        'total_available': unified_balance['total_available_balance'],
-                        'usdt_balance': unified_balance['usdt_balance'],
-                        'full_info': unified_balance
-                    }
-            else:
+            if balance['total_equity'] > 0:
                 self.balance_info = {
                     'source': 'UNIFIED',
-                    'total_equity': unified_balance['total_equity'],
-                    'total_available': unified_balance['total_available_balance'],
-                    'usdt_balance': unified_balance['usdt_balance'],
-                    'full_info': unified_balance
+                    'total_equity': balance['total_equity'],
+                    'total_available': balance['total_available_balance'],
+                    'usdt_balance': balance['usdt_balance'],
+                    'full_info': balance
+                }
+            else:
+                # Пробуем SPOT как запасной вариант
+                balance = self.bybit.get_wallet_balance("SPOT")
+                self.balance_info = {
+                    'source': 'SPOT',
+                    'total_equity': balance['total_equity'],
+                    'total_available': balance['total_available_balance'],
+                    'usdt_balance': balance['usdt_balance'],
+                    'full_info': balance
                 }
 
             # Обновляем максимальный и минимальный баланс
@@ -84,12 +221,11 @@ class TradingBot:
             if current_balance < self.lowest_balance:
                 self.lowest_balance = current_balance
 
-            self.logger.info(
-                f"💰 Баланс [{self.balance_info['source']}]: {self.balance_info['total_equity']:.2f} USDT (доступно: {self.balance_info['total_available']:.2f} USDT)")
+            self.logger.info(f"💰 Баланс: {current_balance:.2f} USDT")
             return True
 
         except Exception as e:
-            self.logger.error(f"Ошибка обновления баланса: {e}")
+            self.logger.error(f"❌ Ошибка обновления баланса: {e}")
             return False
 
     def get_balance_change_info(self):
@@ -112,23 +248,12 @@ class TradingBot:
 
         return arrow, balance_change, balance_change_percent, self.highest_balance, self.lowest_balance
 
-    def get_trading_balance(self):
-        """Возвращает баланс для торговли с приоритетом доступного"""
-        if not self.balance_info:
-            return 0
-
-        # Используем доступный баланс, если он есть, иначе общий equity
-        if self.balance_info['total_available'] > 0:
-            return self.balance_info['total_available']
-        else:
-            return self.balance_info['total_equity']
-
-    def calculate_position_size(self, market_price):
-        """Рассчитываем размер позиции на основе риск-менеджмента"""
+    def calculate_position_size(self, market_price: float) -> float:
+        """Рассчитываем размер позиции с учетом левериджа"""
         if not self.update_balance():
             return 0
 
-        trading_balance = self.get_trading_balance()
+        trading_balance = self.balance_info.get('total_available', 0)
 
         if trading_balance <= 0:
             self.logger.error("❌ Баланс для торговли равен 0")
@@ -142,311 +267,261 @@ class TradingBot:
             (self.max_position_percent / 100)
         position_amount = min(risk_amount, max_position_amount)
 
-        # Проверяем минимальную сумму
-        if position_amount < self.min_trade_usdt:
-            self.logger.warning(
-                f"⚠️ Расчетная сумма сделки {position_amount:.2f} USDT меньше минимальной {self.min_trade_usdt} USDT")
-            return 0
+        # Учитываем леверидж
+        leveraged_amount = position_amount * self.leverage
 
-        # Для quoteCoin ордеров проверяем, что сумма не меньше минимальной для Bybit
-        min_bybit_amount = 10  # Минимум 10 USDT для Bybit
-        if position_amount < min_bybit_amount:
+        # Проверяем минимальную сумму
+        if leveraged_amount < self.min_trade_usdt:
             self.logger.warning(
-                f"⚠️ Сумма сделки {position_amount:.2f} USDT меньше минимальной для Bybit {min_bybit_amount} USDT")
+                f"⚠️ Сумма сделки {leveraged_amount:.2f} USDT меньше минимальной")
             return 0
 
         self.logger.info(
-            f"📊 Расчет позиции: {position_amount:.2f} USDT ({self.risk_percent}% от баланса {trading_balance:.2f} USDT)")
-        return position_amount
+            f"📊 Расчет позиции: {leveraged_amount:.2f} USDT (леверидж {self.leverage}x)")
+        return leveraged_amount
+
+    def calculate_stop_loss_take_profit(self, entry_price: float, side: str) -> tuple:
+        """Расчет стоп-лосса и тейк-профита"""
+        if side == "BUY":
+            stop_loss = entry_price * (1 - self.stop_loss_percent / 100)
+            take_profit = entry_price * (1 + self.take_profit_percent / 100)
+        else:  # SELL
+            stop_loss = entry_price * (1 + self.stop_loss_percent / 100)
+            take_profit = entry_price * (1 - self.take_profit_percent / 100)
+
+        return stop_loss, take_profit
 
     def run_iteration(self):
         """Одна итерация торгового цикла"""
-        iteration_start = time.time()
-
         try:
             # 0. Обновляем баланс
             if not self.update_balance():
-                self.logger.error(
-                    "❌ Не удалось обновить баланс, пропускаем итерацию")
-                return
-
-            trading_balance = self.get_trading_balance()
-            if trading_balance <= 0:
-                self.logger.error("❌ Нет средств для торговли")
-                self._send_balance_report(
-                    None, None, "Нет средств для торговли")
+                self.logger.error("❌ Не удалось обновить баланс")
                 return
 
             # 1. Получаем рыночные данные
-            self.logger.info("📊 Получение рыночных данных...")
             market_data = self.bybit.get_market_data(self.symbol)
             if not market_data:
-                self.logger.error("Не удалось получить рыночные данные")
                 return
 
-            # 2. Получаем сигнал от DeepSeek
-            self.logger.info("🧠 Анализ с помощью DeepSeek...")
-            signal = self.deepseek.get_trading_signal(market_data)
-            self.logger.info(f"Получен сигнал: {signal}")
+            # 2. Обновляем цены открытых позиций
+            self._update_positions_prices(market_data['price'])
 
-            # 3. Рассчитываем размер позиции
+            # 3. Проверяем условия для скользящих стоп-лоссов
+            self._check_trailing_stops(market_data['price'])
+
+            # 4. Получаем сигнал от DeepSeek
+            signal = self.deepseek.get_trading_signal(market_data)
+
+            # 5. Рассчитываем размер позиции
             position_amount = self.calculate_position_size(
                 market_data['price'])
             if position_amount <= 0:
-                self.logger.warning(
-                    "❌ Не удалось рассчитать размер позиции, пропускаем сделку")
-                self._send_balance_report(
-                    market_data, signal, "Пропуск сделки - недостаточно средств или маленькая сумма")
                 return
 
-            # 4. Проверяем уверенность и исполняем сделку
+            # 6. Исполняем сделку если сигнал хороший
             if signal['confidence'] > self.min_confidence:
                 self._execute_trading_decision(
                     signal, market_data, position_amount)
-            else:
-                self.logger.info(
-                    f"Сигнал отклонен: уверенность {signal['confidence']} ниже порога {self.min_confidence}")
-                self._send_balance_report(
-                    market_data, signal, "Пропуск сделки - низкая уверенность")
-
-            # 5. Логируем результат
-            self._log_trading_action(market_data, signal, position_amount)
 
         except Exception as e:
-            self.logger.error(f"Ошибка в торговой итерации: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"❌ Ошибка в торговой итерации: {e}")
 
-    def _execute_trading_decision(self, signal, market_data, position_amount):
+    def _update_positions_prices(self, current_price: float):
+        """Обновление цен открытых позиций"""
+        open_positions = self.db.get_open_positions()
+        for position in open_positions:
+            self.db.update_position_price(position['id'], current_price)
+
+    def _check_trailing_stops(self, current_price: float):
+        """Проверка условий для скользящих стоп-лоссов"""
+        open_positions = self.db.get_open_positions()
+
+        for position in open_positions:
+            position_id = position['id']
+            entry_price = position['entry_price']
+            current_sl = position['stop_loss']
+            side = position['side']
+
+            if side == "BUY":
+                # Для лонгов: поднимаем стоп-лосс когда цена растет
+                if current_price > entry_price:
+                    new_sl = entry_price * (1 + 0.005)  # +0.5% от цены входа
+                    if not current_sl or new_sl > current_sl:
+                        self.db.update_stop_loss(position_id, new_sl)
+
+                    # Проверяем достижение стоп-лосса или тейк-профита
+                    if current_sl and current_price <= current_sl:
+                        self._close_position_by_id(
+                            position_id, current_price, "stop_loss")
+                    elif position['take_profit'] and current_price >= position['take_profit']:
+                        self._close_position_by_id(
+                            position_id, current_price, "take_profit")
+
+            else:  # SELL
+                # Для шортов: опускаем стоп-лосс когда цена падает
+                if current_price < entry_price:
+                    new_sl = entry_price * (1 - 0.005)  # -0.5% от цены входа
+                    if not current_sl or new_sl < current_sl:
+                        self.db.update_stop_loss(position_id, new_sl)
+
+                    # Проверяем достижение стоп-лосса или тейк-профита
+                    if current_sl and current_price >= current_sl:
+                        self._close_position_by_id(
+                            position_id, current_price, "stop_loss")
+                    elif position['take_profit'] and current_price <= position['take_profit']:
+                        self._close_position_by_id(
+                            position_id, current_price, "take_profit")
+
+    def _execute_trading_decision(self, signal: Dict, market_data: Dict, position_amount: float):
         """Исполняет торговое решение"""
         try:
-            if signal['action'] == 'BUY':
+            if signal['action'] == 'BUY' and not self._has_open_position():
                 self._execute_buy(signal, market_data, position_amount)
-            elif signal['action'] == 'SELL':
+            elif signal['action'] == 'SELL' and not self._has_open_position():
                 self._execute_sell(signal, market_data, position_amount)
-            elif signal['action'] == 'HOLD':
-                self.logger.info("Сигнал HOLD - бездействуем")
-                self._send_balance_report(
-                    market_data, signal, "Удержание позиции")
-            else:
-                self.logger.warning(
-                    f"Неизвестное действие: {signal['action']}")
 
         except Exception as e:
-            self.logger.error(f"Ошибка исполнения сделки: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+            self.logger.error(f"❌ Ошибка исполнения сделки: {e}")
 
-    def _execute_buy(self, signal, market_data, position_amount):
+    def _execute_buy(self, signal: Dict, market_data: Dict, position_amount: float):
         """Исполняет покупку"""
-        self.logger.info(
-            f"🎯 Исполняем BUY сигнал (уверенность: {signal['confidence']}, сумма: {position_amount:.2f} USDT)")
+        self.logger.info(f"🎯 Исполняем BUY сигнал")
 
-        # Проверяем, нет ли уже открытой позиции
-        if self._has_open_position():
-            self.logger.info("⏸️ Пропускаем BUY - уже есть открытая позиция")
-            self._send_balance_report(
-                market_data, signal, "Пропуск покупки - позиция уже открыта")
-            return
+        entry_price = market_data['price']
+        stop_loss, take_profit = self.calculate_stop_loss_take_profit(
+            entry_price, "BUY")
 
-        # Используем quoteCoin - покупаем на рассчитанную сумму в USDT
+        # Рассчитываем количество контрактов
+        quantity = position_amount / entry_price
+
         order = self.bybit.place_order(
             symbol=self.symbol,
             side="Buy",
-            qty=position_amount,
-            market_unit="quoteCoin"  # Указываем, что qty - это сумма в USDT
+            qty=quantity,
+            leverage=self.leverage,
+            stop_loss=stop_loss,
+            take_profit=take_profit
         )
 
         if order:
-            # Рассчитываем примерное количество купленного ETH
-            eth_amount = position_amount / market_data['price']
+            # Сохраняем позицию в базу
+            position_id = self.db.add_position(
+                symbol=self.symbol,
+                side="BUY",
+                size=quantity,
+                entry_price=entry_price,
+                leverage=self.leverage,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
 
-            self.logger.info(
-                f"✅ Куплено на {position_amount:.2f} USDT (~{eth_amount:.6f} ETH)")
+            # Отправляем уведомление
+            self._send_trade_notification(
+                "🟢 ПОКУПКА", position_id, signal, entry_price)
 
-            # Записываем позицию
-            position = {
-                'symbol': self.symbol,
-                'side': 'BUY',
-                'size_usdt': position_amount,
-                'size_eth': eth_amount,
-                'entry_price': market_data['price'],
-                'timestamp': datetime.now().isoformat(),
-                'signal': signal
-            }
-            self.positions.append(position)
-
-            # Обновляем баланс после сделки
-            self.update_balance()
-
-            # Отправляем уведомление в Telegram
-            self._send_trade_notification("🟢 ПОКУПКА", position, signal)
-        else:
-            self.logger.error("❌ Не удалось разместить ордер на покупку")
-            self._send_error_notification(
-                f"Не удалось разместить ордер на покупку {position_amount:.2f} USDT")
-
-    def _execute_sell(self, signal, market_data, position_amount):
+    def _execute_sell(self, signal: Dict, market_data: Dict, position_amount: float):
         """Исполняет продажу"""
-        self.logger.info(
-            f"🎯 Исполняем SELL сигнал (уверенность: {signal['confidence']})")
+        self.logger.info(f"🎯 Исполняем SELL сигнал")
 
-        # Проверяем, есть ли открытая позиция для продажи
-        if not self._has_open_position():
-            self.logger.info("⏸️ Пропускаем SELL - нет открытой позиции")
-            self._send_balance_report(
-                market_data, signal, "Пропуск продажи - нет открытой позиции")
-            return
+        entry_price = market_data['price']
+        stop_loss, take_profit = self.calculate_stop_loss_take_profit(
+            entry_price, "SELL")
 
-        # Используем размер последней позиции в ETH
-        position = self.positions[-1] if self.positions else None
-        if not position:
-            self.logger.error("❌ Нет данных о позиции для продажи")
-            return
+        # Рассчитываем количество контрактов
+        quantity = position_amount / entry_price
 
-        # Продаем всё количество ETH из позиции
         order = self.bybit.place_order(
             symbol=self.symbol,
             side="Sell",
-            qty=position['size_eth'],  # Количество ETH для продажи
-            market_unit="baseCoin"  # Указываем, что qty - это количество монет
+            qty=quantity,
+            leverage=self.leverage,
+            stop_loss=stop_loss,
+            take_profit=take_profit
         )
 
         if order:
-            # Рассчитываем P&L
-            pnl = (market_data['price'] -
-                   position['entry_price']) * position['size_eth']
-            pnl_percent = (
-                (market_data['price'] - position['entry_price']) / position['entry_price']) * 100
+            # Сохраняем позицию в базу
+            position_id = self.db.add_position(
+                symbol=self.symbol,
+                side="SELL",
+                size=quantity,
+                entry_price=entry_price,
+                leverage=self.leverage,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
 
-            self.logger.info(
-                f"✅ Продано {position['size_eth']:.6f} {self.symbol} (P&L: {pnl:.2f} USDT, {pnl_percent:.2f}%)")
+            # Отправляем уведомление
+            self._send_trade_notification(
+                "🔴 ПРОДАЖА", position_id, signal, entry_price)
 
-            # Закрываем позицию
-            closed_position = self.positions.pop()
-
-            # Обновляем баланс после сделки
-            self.update_balance()
-
-            # Отправляем уведомление в Telegram
-            self._send_trade_notification("🔴 ПРОДАЖА", {
-                'symbol': self.symbol,
-                'side': 'SELL',
-                'size_eth': position['size_eth'],
-                'size_usdt': position['size_usdt'],
-                'entry_price': position['entry_price'],
-                'exit_price': market_data['price'],
-                'pnl': pnl,
-                'pnl_percent': pnl_percent,
-                'timestamp': datetime.now().isoformat(),
-                'signal': signal
-            }, signal)
-        else:
-            self.logger.error("❌ Не удалось разместить ордер на продажу")
-            self._send_error_notification(
-                f"Не удалось разместить ордер на продажу {position['size_eth']:.6f} ETH")
-
-    def _has_open_position(self):
+    def _has_open_position(self) -> bool:
         """Проверяет, есть ли открытая позиция"""
-        return len(self.positions) > 0
+        return len(self.db.get_open_positions()) > 0
 
-    def _log_trading_action(self, market_data, signal, position_amount):
-        """Логирует торговое действие"""
-        trading_balance = self.get_trading_balance()
-        arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
+    def _close_position_by_id(self, position_id: int, exit_price: float, reason: str):
+        """Закрытие позиции по ID"""
+        position = self.db.get_position(position_id)
+        if position and position['status'] == 'open':
+            success = self.bybit.close_position(
+                position['symbol'], position['side'])
+            if success:
+                self.db.close_position(position_id, exit_price)
+                self.logger.info(
+                    f"✅ Позиция #{position_id} закрыта по причине: {reason}")
 
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'symbol': self.symbol,
-            'price': market_data['price'],
-            'signal': signal,
-            'position_amount': position_amount,
-            'trading_balance': trading_balance,
-            'balance_source': self.balance_info.get('source', 'unknown'),
-            'open_positions': len(self.positions),
-            'balance_change': balance_change,
-            'balance_change_percent': balance_change_percent,
-            'highest_balance': highest,
-            'lowest_balance': lowest
-        }
-        self.logger.info(f"Торговая запись: {log_entry}")
-
-    def _get_moscow_time(self):
-        """Возвращает текущее время по Москве"""
-        try:
-            moscow_tz = pytz.timezone('Europe/Moscow')
-            return datetime.now(moscow_tz)
-        except:
-            # Если pytz не работает, возвращаем UTC+3
-            from datetime import timedelta
-            return datetime.utcnow() + timedelta(hours=3)
-
-    def _send_trade_notification(self, action, position, signal):
+    def _send_trade_notification(self, action: str, position_id: int, signal: Dict, entry_price: float):
         """Отправляет уведомление о сделке в Telegram"""
         try:
             import requests
             from config import Config
 
             token = Config.TELEGRAM_BOT_TOKEN
-            chat_id = Config.TELEGRAM_CHAT_ID
 
             if not token or token == "your_telegram_token":
                 return
 
-            trading_balance = self.get_trading_balance()
+            # Получаем информацию о балансе
+            arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
+            trading_balance = self.balance_info.get('total_equity', 0)
             balance_source = self.balance_info.get('source', 'UNKNOWN')
+
+            # Получаем позицию из базы
+            position = self.db.get_position(position_id)
+            if not position:
+                self.logger.error(f"Позиция {position_id} не найдена в базе")
+                return
+
             moscow_time = self._get_moscow_time()
 
-            # Получаем информацию об изменении баланса
-            arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
-
-            if action == "🟢 ПОКУПКА":
-                message = f"""
+            message = f"""
 {action}
 
+🆔 *ID позиции:* #{position_id}
 💹 *Символ:* {position['symbol']}
 💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
 {arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
 📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
-💵 *Сумма сделки:* {position['size_usdt']:.2f} USDT
-📊 *Размер позиции:* {self.risk_percent}% от баланса
-🪙 *Количество:* {position['size_eth']:.6f} ETH
-💸 *Цена входа:* ${position['entry_price']:.2f}
+💵 *Размер позиции:* {position['size']:.4f}
+🔢 *Леверидж:* {position['leverage']}x
+💸 *Цена входа:* ${entry_price:.2f}
+📉 *Стоп-лосс:* ${position.get('stop_loss', 0):.2f}
+📈 *Тейк-профит:* ${position.get('take_profit', 0):.2f}
 
-🎯 *Сигнал AI:* {signal['action']}
-⭐ *Уверенность:* {signal['confidence']:.2f}
-💭 *Причина:* {signal['reason']}
-
-⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
-"""
-            else:
-                # Для продажи
-                pnl_emoji = "📈" if position['pnl'] >= 0 else "📉"
-                message = f"""
-{action}
-
-💹 *Символ:* {position['symbol']}
-💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
-{arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
-📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
-🪙 *Количество:* {position['size_eth']:.6f} ETH
-💸 *Цена входа:* ${position['entry_price']:.2f}
-💰 *Цена выхода:* ${position['exit_price']:.2f}
-{pnl_emoji} *P&L:* {position['pnl']:.2f} USDT ({position['pnl_percent']:.2f}%)
-
-🎯 *Сигнал AI:* {signal['action']}
-⭐ *Уверенность:* {signal['confidence']:.2f}
-💭 *Причина:* {signal['reason']}
+🎯 *Сигнал AI:* {signal.get('action', 'N/A')}
+⭐ *Уверенность:* {signal.get('confidence', 0):.2f}
+💭 *Причина:* {signal.get('reason', 'N/A')}
 
 ⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
 📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
 """
 
+            # Отправляем сообщение через Telegram API
             url = f"https://api.telegram.org/bot{token}/sendMessage"
+
             payload = {
-                'chat_id': chat_id,
+                'chat_id': Config.TELEGRAM_CHAT_ID,
                 'text': message,
                 'parse_mode': 'Markdown'
             }
@@ -457,109 +532,15 @@ class TradingBot:
             self.logger.warning(
                 f"Не удалось отправить уведомление о сделке: {e}")
 
-    def _send_balance_report(self, market_data, signal, status):
-        """Отправляет отчет о балансе без сделки"""
+    def _get_moscow_time(self):
+        """Возвращает текущее время по Москве"""
         try:
-            import requests
-            from config import Config
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            return datetime.now(moscow_tz)
+        except:
+            from datetime import timedelta
+            return datetime.utcnow() + timedelta(hours=3)
 
-            token = Config.TELEGRAM_BOT_TOKEN
-            chat_id = Config.TELEGRAM_CHAT_ID
-
-            if not token or token == "your_telegram_token":
-                return
-
-            trading_balance = self.get_trading_balance()
-            balance_source = self.balance_info.get('source', 'UNKNOWN')
-            moscow_time = self._get_moscow_time()
-
-            # Получаем информацию об изменении баланса
-            arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
-
-            price_info = ""
-            if market_data:
-                price_info = f"📈 *Цена:* ${market_data['price']:.2f}\n"
-
-            signal_info = ""
-            if signal:
-                signal_info = f"""
-🎯 *Сигнал AI:* {signal['action']}
-⭐ *Уверенность:* {signal['confidence']:.2f}
-💭 *Причина:* {signal['reason']}
-"""
-
-            message = f"""
-📊 *ОТЧЕТ О БАЛАНСЕ*
-
-💹 *Символ:* {self.symbol}
-💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
-{arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
-📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
-📈 *Максимальный баланс:* {highest:.2f} USDT
-📉 *Минимальный баланс:* {lowest:.2f} USDT
-{price_info}
-📊 *Размер позиции:* {self.risk_percent}% от баланса
-{signal_info}
-📋 *Статус:* {status}
-
-⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
-"""
-
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-
-            requests.post(url, json=payload, timeout=10)
-
-        except Exception as e:
-            self.logger.warning(f"Не удалось отправить отчет о балансе: {e}")
-
-    def _send_error_notification(self, error_message):
-        """Отправляет уведомление об ошибке"""
-        try:
-            import requests
-            from config import Config
-
-            token = Config.TELEGRAM_BOT_TOKEN
-            chat_id = Config.TELEGRAM_CHAT_ID
-
-            if not token or token == "your_telegram_token":
-                return
-
-            trading_balance = self.get_trading_balance()
-            balance_source = self.balance_info.get('source', 'UNKNOWN')
-            moscow_time = self._get_moscow_time()
-
-            # Получаем информацию об изменении баланса
-            arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
-
-            message = f"""
-🚨 *ОШИБКА ТОРГОВЛИ*
-
-💹 *Символ:* {self.symbol}
-💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
-{arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
-📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
-
-❌ *Ошибка:* {error_message}
-
-⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
-"""
-
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-
-            requests.post(url, json=payload, timeout=10)
-
-        except Exception as e:
-            self.logger.error(
-                f"Не удалось отправить уведомление об ошибке: {e}")
+    def stop(self):
+        """Остановка бота"""
+        self.bybit.stop_websocket()

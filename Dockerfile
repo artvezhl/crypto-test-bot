@@ -1,26 +1,37 @@
 FROM python:3.11-slim
 
+# Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
+# Создание пользователя приложения
+RUN useradd --create-home --shell /bin/bash app
+
 WORKDIR /app
 
-# Копируем requirements и устанавливаем зависимости
+# Копирование requirements и установка зависимостей
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь проект включая src
-COPY . .
+# Копирование исходного кода
+COPY src/ ./src/
+COPY config.py ./
+COPY main.py ./
 
-# Устанавливаем src в PYTHONPATH
-ENV PYTHONPATH=/app/src
+# Создание директорий для данных и логов
+RUN mkdir -p logs data backups && \
+    chown -R app:app /app
 
-RUN useradd -m -r trader && \
-    chown -R trader:trader /app
-USER trader
+USER app
 
-# Запускаем из src
-CMD ["python", "-u", "src/main.py"]
+# Переменные окружения
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)" || exit 1
+
+CMD ["python", "main.py"]

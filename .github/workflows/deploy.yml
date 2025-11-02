@@ -2,13 +2,14 @@ name: Deploy Trading Bot
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  DOCKER_COMPOSE_VERSION: '2.24.0'
 
 jobs:
   test:
@@ -26,39 +27,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest pytest-asyncio
 
-      - name: Find and compile Python files in src
+      - name: Run basic syntax checks
         run: |
-          echo "🔍 Looking for Python files in src directory..."
-          find src -name "*.py" -not -path "*/__pycache__/*" | head -10
-          
-          if find src -name "*.py" -not -path "*/__pycache__/*" -quit; then
-            echo "📦 Compiling Python files in src..."
-            find src -name "*.py" -not -path "*/__pycache__/*" -exec python -m py_compile {} \;
-            echo "✅ All Python files in src compiled successfully"
+          echo "🔍 Running syntax checks..."
+          python -m py_compile src/*.py config.py main.py
+          echo "✅ Syntax checks passed"
+
+      - name: Run tests
+        run: |
+          echo "🧪 Running tests..."
+          # Создаем простые тесты если их нет
+          if [ -f "test_imports.py" ]; then
+            python test_imports.py
           else
-            echo "⚠️ No Python files found in src directory"
+            python -c "
+            try:
+                from config import Config
+                from database import Database
+                print('✅ All imports successful')
+            except Exception as e:
+                print(f'❌ Import error: {e}')
+                exit(1)
+            "
           fi
-
-      - name: Check imports from src
-        run: |
-          echo "🔍 Testing imports from src..."
-          export PYTHONPATH=src:$PYTHONPATH
-          python -c "import pytz, requests; print('✅ Basic imports successful')"
-          
-          python -c "
-          try:
-              from config import Config
-              print('✅ Config import successful')
-          except ImportError as e:
-              print(f'⚠️ Config import failed: {e}')
-              
-          try:
-              from main import TradingBot
-              print('✅ TradingBot import successful')
-          except ImportError as e:
-              print(f'⚠️ TradingBot import failed: {e}')
-          "
 
   build-and-push:
     needs: test
@@ -91,30 +84,60 @@ jobs:
             type=ref,event=branch
             type=sha,prefix=commit-
             type=raw,value=latest
+            type=raw,value=production
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
 
-  deploy:
+  security-scan:
     needs: build-and-push
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create .env file from secrets and variables
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy:
+    needs: [build-and-push, security-scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create production .env file
         run: |
-          echo "🔐 Creating .env file from GitHub Secrets and Variables..."
-          cat > .env << EOF
+          echo "🔐 Creating production .env file..."
+          cat > .env.production << EOF
+          # Deployment
+          NODE_ENV=production
+          GITHUB_USERNAME=${{ github.repository_owner }}
+          REPO_NAME=${{ github.event.repository.name }}
+          TAG=production
+
           # Bybit API
           BYBIT_API_KEY=${{ secrets.BYBIT_API_KEY }}
           BYBIT_API_SECRET=${{ secrets.BYBIT_API_SECRET }}
@@ -140,107 +163,139 @@ jobs:
           STOP_LOSS_PERCENT=${{ vars.STOP_LOSS_PERCENT }}
           TAKE_PROFIT_PERCENT=${{ vars.TAKE_PROFIT_PERCENT }}
 
+          # Database
+          DATABASE_URL=${{ vars.DATABASE_URL }}
+
           # Initial Balance
           INITIAL_BALANCE=${{ vars.INITIAL_BALANCE }}
           EOF
-          echo "✅ .env file created"
+          echo "✅ Production .env file created"
 
-      - name: Deploy to server
+      - name: Deploy to production server
         env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
         run: |
           set -e
-          echo "📦 Starting Docker deployment..."
+          echo "🚀 Starting production deployment..."
 
-          # Создаем скрипт деплоя с Docker
-          cat > deploy-docker.sh << 'SCRIPT'
+          # Создаем SSH ключ
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Создаем скрипт деплоя
+          cat > deploy.sh << 'SCRIPT'
           #!/bin/bash
           set -e
 
-          echo "🔧 Checking Docker installation..."
+          echo "🔧 Setting up deployment environment..."
+          
+          # Создаем директории
+          sudo mkdir -p /opt/trading-bot/{compose,logs,data,backups}
+          sudo chown -R $SERVER_USER:$SERVER_USER /opt/trading-bot
+          sudo chmod 755 /opt/trading-bot
+
+          # Копируем файлы
+          cp /tmp/docker-compose.prod.yml /opt/trading-bot/compose/docker-compose.yml
+          cp /tmp/.env.production /opt/trading-bot/.env
+          chmod 600 /opt/trading-bot/.env
+
+          echo "🐳 Setting up Docker..."
           if ! command -v docker &> /dev/null; then
-            echo "🐳 Installing Docker..."
+            echo "Installing Docker..."
             curl -fsSL https://get.docker.com -o get-docker.sh
-            sh get-docker.sh
+            sudo sh get-docker.sh
             sudo usermod -aG docker $USER
           fi
 
-          echo "🐳 Logging into GitHub Container Registry..."
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+          echo "📦 Setting up Docker Compose..."
+          if ! command -v docker-compose &> /dev/null; then
+            sudo curl -L "https://github.com/docker/compose/releases/download/v$DOCKER_COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
 
-          echo "📥 Pulling latest Docker image..."
-          docker pull $IMAGE_NAME:main
+          cd /opt/trading-bot
 
-          echo "🛑 Stopping existing container..."
-          docker stop trading-bot 2>/dev/null || true
-          docker rm trading-bot 2>/dev/null || true
+          echo "🔐 Logging into GitHub Container Registry..."
+          echo "$GITHUB_TOKEN" | sudo docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
 
-          echo "🚀 Starting new container..."
-          docker run -d \
-            --name trading-bot \
-            --restart unless-stopped \
-            --env-file /opt/trading-bot/.env \
-            -v /opt/trading-bot/logs:/app/logs \
-            -v /opt/trading-bot/data:/app/data \
-            $IMAGE_NAME:main
+          echo "📥 Pulling latest image..."
+          sudo docker-compose pull
 
-          echo "🧹 Cleaning up old images..."
-          docker image prune -f
+          echo "🔄 Starting services..."
+          sudo docker-compose up -d
 
-          echo "✅ Docker deployment completed!"
-          echo "📊 Container status:"
-          docker ps --filter "name=trading-bot"
+          echo "🧹 Cleaning up..."
+          sudo docker system prune -f
+
+          echo "✅ Deployment completed!"
           SCRIPT
 
-          echo "📤 Uploading deployment script and .env file..."
-          sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
-            deploy-docker.sh \
-            .env \
+          chmod +x deploy.sh
+
+          # Копируем файлы на сервер
+          echo "📤 Uploading files to server..."
+          scp -o StrictHostKeyChecking=no \
+            docker-compose.prod.yml \
+            .env.production \
+            deploy.sh \
             $SERVER_USER@$SERVER_HOST:/tmp/
 
-          echo "🏗️ Setting up directory structure and .env file..."
-          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
-            $SERVER_USER@$SERVER_HOST "
-            mkdir -p /opt/trading-bot/{logs,data}
-            chmod 755 /opt/trading-bot
-            # Копируем .env файл с правильными правами
-            cp /tmp/.env /opt/trading-bot/.env
-            chmod 600 /opt/trading-bot/.env
-            echo '✅ .env file deployed to /opt/trading-bot/.env'
-          "
-
-          echo "🚀 Executing deployment script..."
-          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
-            $SERVER_USER@$SERVER_HOST "
+          # Запускаем деплой
+          echo "🏗️ Executing deployment..."
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
             export GITHUB_TOKEN='${{ secrets.GITHUB_TOKEN }}'
             export GITHUB_ACTOR='${{ github.actor }}'
-            export IMAGE_NAME='ghcr.io/${{ github.repository }}'
-            chmod +x /tmp/deploy-docker.sh
-            cd /opt/trading-bot
-            timeout 600 /tmp/deploy-docker.sh
+            export DOCKER_COMPOSE_VERSION='${{ env.DOCKER_COMPOSE_VERSION }}'
+            chmod +x /tmp/deploy.sh
+            /tmp/deploy.sh
           "
 
       - name: Verify deployment
         env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
         run: |
+          set -e
           echo "🔍 Verifying deployment..."
-          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
-            $SERVER_USER@$SERVER_HOST "
-            echo '📦 Docker containers:'
-            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -10
+          
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
+            echo '📊 Deployment Status:'
+            echo '==================='
+            
             echo ''
-            echo '📊 Trading bot logs (last 5 lines):'
-            docker logs trading-bot --tail 5 2>/dev/null || echo '❌ Container not running or no logs yet'
+            echo '🐳 Docker Containers:'
+            sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            
             echo ''
-            echo '🔐 Environment variables check (names only):'
-            docker exec trading-bot env | grep -E '(BYBIT|DEEPSEEK|TELEGRAM|TRADING|RISK|INITIAL)' | cut -d= -f1 | sort
+            echo '📈 Trading Bot Logs:'
+            sudo docker logs trading-bot --tail 10 2>/dev/null || echo 'No logs yet'
+            
+            echo ''
+            echo '💾 Disk Usage:'
+            df -h /opt/trading-bot
+            
+            echo ''
+            echo '🔍 Service Health:'
+            sudo docker inspect --format='{{.State.Health.Status}}' trading-bot 2>/dev/null || echo 'No health check'
           "
+
+      - name: Send deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deployment completed successfully!"
+          else
+            echo "❌ Deployment failed!"
+          fi
 
       - name: Cleanup
         run: |
-          rm -f deploy-docker.sh .env
+          rm -f deploy.sh .env.production
