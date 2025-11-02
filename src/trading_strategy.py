@@ -162,20 +162,20 @@ class TradingBot:
             pnl_emoji = "📈" if pnl >= 0 else "📉"
 
             message = f"""
-🔒 *ПОЗИЦИЯ ЗАКРЫТА*
+            🔒 *ПОЗИЦИЯ ЗАКРЫТА*
 
-🆔 *ID:* #{position['id']}
-💹 *Символ:* {position['symbol']}
-📊 *Сторона:* {position['side']}
-💵 *Цена входа:* ${position['entry_price']:.2f}
-💰 *Цена выхода:* ${close_price:.2f}
-{pnl_emoji} *P&L:* {pnl:.2f} USDT ({pnl_percent:.2f}%)
-🔢 *Размер:* {position['size']:.4f}
-⚡ *Леверидж:* {position['leverage']}x
+            🆔 *ID:* #{position['id']}
+            💹 *Символ:* {position['symbol']}
+            📊 *Сторона:* {position['side']}
+            💵 *Цена входа:* ${position['entry_price']:.2f}
+            💰 *Цена выхода:* ${close_price:.2f}
+            {pnl_emoji} *P&L:* {pnl:.2f} USDT ({pnl_percent:.2f}%)
+            🔢 *Размер:* {position['size']:.4f}
+            ⚡ *Леверидж:* {position['leverage']}x
 
-⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
-"""
+            ⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
+            📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
+            """
 
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {

@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей
+# Установка системных зависимостей для PostgreSQL
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Создание пользователя приложения
@@ -27,10 +28,6 @@ USER app
 # Переменные окружения
 ENV PYTHONPATH=/app/src:/app
 ENV PYTHONUNBUFFERED=1
-
-# Health check (если нужно, можно временно отключить)
-# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-#     CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)" || exit 1
 
 # Запускаем из src/main.py
 CMD ["python", "src/main.py"]
