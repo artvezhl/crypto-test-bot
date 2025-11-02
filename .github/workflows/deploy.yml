@@ -27,11 +27,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run syntax and import checks
+      - name: Find and compile Python files in src
         run: |
-          python -m py_compile *.py
-          python -c "import pytz, requests"
-          echo "✅ All checks passed"
+          echo "🔍 Looking for Python files in src directory..."
+          find src -name "*.py" -not -path "*/__pycache__/*" | head -10
+          
+          # Компилируем все найденные Python файлы в src
+          if find src -name "*.py" -not -path "*/__pycache__/*" -quit; then
+            echo "📦 Compiling Python files in src..."
+            find src -name "*.py" -not -path "*/__pycache__/*" -exec python -m py_compile {} \;
+            echo "✅ All Python files in src compiled successfully"
+          else
+            echo "⚠️ No Python files found in src directory"
+          fi
+
+      - name: Check imports from src
+        run: |
+          echo "🔍 Testing imports from src..."
+          # Добавляем src в PYTHONPATH для импорта модулей
+          export PYTHONPATH=src:$PYTHONPATH
+          python -c "import pytz, requests; print('✅ Basic imports successful')"
+          
+          # Проверяем импорты из нашего кода
+          python -c "
+          try:
+              from config import Config
+              print('✅ Config import successful')
+          except ImportError as e:
+              print(f'⚠️ Config import failed: {e}')
+              
+          try:
+              from main import TradingBot
+              print('✅ TradingBot import successful')
+          except ImportError as e:
+              print(f'⚠️ TradingBot import failed: {e}')
+          "
 
   build-and-push:
     needs: test
@@ -98,18 +128,19 @@ jobs:
           #!/bin/bash
           set -e
 
-          echo "🔧 Installing Docker if not present..."
+          echo "🔧 Checking Docker installation..."
           if ! command -v docker &> /dev/null; then
+            echo "🐳 Installing Docker..."
             curl -fsSL https://get.docker.com -o get-docker.sh
             sh get-docker.sh
             sudo usermod -aG docker $USER
           fi
 
           echo "🐳 Logging into GitHub Container Registry..."
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
 
           echo "📥 Pulling latest Docker image..."
-          docker pull ghcr.io/${{ github.repository }}:main
+          docker pull $IMAGE_NAME:main
 
           echo "🛑 Stopping existing container..."
           docker stop trading-bot 2>/dev/null || true
@@ -122,7 +153,7 @@ jobs:
             --env-file /opt/trading-bot/.env \
             -v /opt/trading-bot/logs:/app/logs \
             -v /opt/trading-bot/data:/app/data \
-            ghcr.io/${{ github.repository }}:main
+            $IMAGE_NAME:main
 
           echo "🧹 Cleaning up old images..."
           docker image prune -f
@@ -132,30 +163,9 @@ jobs:
           docker ps --filter "name=trading-bot"
           SCRIPT
 
-          # Копируем docker-compose для продакшена если нужно
-          cat > docker-compose.prod.yml << 'COMPOSE'
-          version: '3.8'
-          services:
-            trading-bot:
-              image: ghcr.io/${{ github.repository }}:main
-              container_name: trading-bot
-              restart: unless-stopped
-              volumes:
-                - ./logs:/app/logs
-                - ./data:/app/data
-              env_file:
-                - .env
-              logging:
-                driver: "json-file"
-                options:
-                  max-size: "10m"
-                  max-file: "3"
-          COMPOSE
-
-          echo "📤 Uploading deployment files..."
+          echo "📤 Uploading deployment script..."
           sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             deploy-docker.sh \
-            docker-compose.prod.yml \
             $SERVER_USER@$SERVER_HOST:/tmp/
 
           echo "🏗️ Setting up directory structure..."
@@ -164,8 +174,8 @@ jobs:
             mkdir -p /opt/trading-bot/{logs,data}
             chmod 755 /opt/trading-bot
             if [ ! -f /opt/trading-bot/.env ]; then
-              echo '⚠️  Warning: .env file not found. Please create /opt/trading-bot/.env'
-              touch /opt/trading-bot/.env
+              echo '⚠️  Warning: .env file not found. Creating empty file at /opt/trading-bot/.env'
+              echo '# Add your environment variables here' > /opt/trading-bot/.env
               chmod 600 /opt/trading-bot/.env
             fi
           "
@@ -173,9 +183,11 @@ jobs:
           echo "🚀 Executing deployment script..."
           sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             $SERVER_USER@$SERVER_HOST "
+            export GITHUB_TOKEN='${{ secrets.GITHUB_TOKEN }}'
+            export GITHUB_ACTOR='${{ github.actor }}'
+            export IMAGE_NAME='ghcr.io/${{ github.repository }}'
             chmod +x /tmp/deploy-docker.sh
             cd /opt/trading-bot
-            cp /tmp/docker-compose.prod.yml ./docker-compose.yml 2>/dev/null || true
             timeout 600 /tmp/deploy-docker.sh
           "
 
@@ -189,79 +201,12 @@ jobs:
           sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             $SERVER_USER@$SERVER_HOST "
             echo '📦 Docker containers:'
-            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -10
             echo ''
-            echo '📊 Trading bot logs (last 10 lines):'
-            docker logs trading-bot --tail 10 2>/dev/null || echo '❌ Container not running'
+            echo '📊 Trading bot logs (last 5 lines):'
+            docker logs trading-bot --tail 5 2>/dev/null || echo '❌ Container not running or no logs yet'
           "
 
       - name: Cleanup
         run: |
-          rm -f deploy-docker.sh docker-compose.prod.yml
-
-  # Альтернативный вариант деплоя с PM2 (если хотите оставить как запасной)
-  deploy-pm2:
-    needs: [test, build-and-push]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy with PM2 (backup)
-        env:
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
-        run: |
-          set -e
-          echo "🔄 Starting PM2 deployment (backup method)..."
-          
-          cat > deploy-pm2.sh << 'SCRIPT'
-          #!/bin/bash
-          set -e
-          
-          echo "🔄 Updating code in ~/trading-bot..."
-          cd ~/trading-bot
-          
-          echo "🔧 Installing system dependencies..."
-          sudo apt update && sudo apt install -y python3-venv python3-pip
-          
-          echo "🐍 Setting up Python environment..."
-          python3 -m venv venv --clear
-          source venv/bin/activate
-          
-          echo "📚 Installing Python dependencies..."
-          pip install --upgrade pip
-          pip install --timeout 60 -r requirements.txt
-          
-          echo "🔧 Ensuring PM2 is installed..."
-          if ! command -v pm2 &> /dev/null; then
-            curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-            sudo apt install -y nodejs
-            sudo npm install -g pm2
-          fi
-          
-          echo "🚀 (Re)starting bot with PM2..."
-          pm2 delete trading-bot 2>/dev/null || true
-          pm2 start main.py --name "trading-bot" --interpreter venv/bin/python
-          pm2 save
-          pm2 startup 2>/dev/null || true
-          
-          echo "✅ PM2 deployment completed!"
-          pm2 status
-          SCRIPT
-          
-          echo "📤 Copying project files..."
-          sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no -r . $SERVER_USER@$SERVER_HOST:~/trading-bot-backup/
-          
-          echo "🚀 Running PM2 deployment..."
-          sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no deploy-pm2.sh $SERVER_USER@$SERVER_HOST:/tmp/
-          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
-            chmod +x /tmp/deploy-pm2.sh
-            cd ~/trading-bot-backup
-            timeout 300 /tmp/deploy-pm2.sh
-          "
-          
-          rm -f deploy-pm2.sh
+          rm -f deploy-docker.sh
