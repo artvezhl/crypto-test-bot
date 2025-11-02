@@ -32,7 +32,6 @@ jobs:
           echo "🔍 Looking for Python files in src directory..."
           find src -name "*.py" -not -path "*/__pycache__/*" | head -10
           
-          # Компилируем все найденные Python файлы в src
           if find src -name "*.py" -not -path "*/__pycache__/*" -quit; then
             echo "📦 Compiling Python files in src..."
             find src -name "*.py" -not -path "*/__pycache__/*" -exec python -m py_compile {} \;
@@ -44,11 +43,9 @@ jobs:
       - name: Check imports from src
         run: |
           echo "🔍 Testing imports from src..."
-          # Добавляем src в PYTHONPATH для импорта модулей
           export PYTHONPATH=src:$PYTHONPATH
           python -c "import pytz, requests; print('✅ Basic imports successful')"
           
-          # Проверяем импорты из нашего кода
           python -c "
           try:
               from config import Config
@@ -114,6 +111,40 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Create .env file from secrets and variables
+        run: |
+          echo "🔐 Creating .env file from GitHub Secrets and Variables..."
+          cat > .env << EOF
+          # Bybit API
+          BYBIT_API_KEY=${{ secrets.BYBIT_API_KEY }}
+          BYBIT_API_SECRET=${{ secrets.BYBIT_API_SECRET }}
+          BYBIT_TESTNET=${{ vars.BYBIT_TESTNET }}
+
+          # DeepSeek API
+          DEEPSEEK_API_KEY=${{ secrets.DEEPSEEK_API_KEY }}
+
+          # Telegram
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Trading Settings
+          TRADING_INTERVAL_MINUTES=${{ vars.TRADING_INTERVAL_MINUTES }}
+          DEFAULT_SYMBOL=${{ vars.DEFAULT_SYMBOL }}
+          POSITION_SIZE=${{ vars.POSITION_SIZE }}
+          MIN_CONFIDENCE=${{ vars.MIN_CONFIDENCE }}
+
+          # Risk Management
+          RISK_PERCENT=${{ vars.RISK_PERCENT }}
+          MAX_POSITION_PERCENT=${{ vars.MAX_POSITION_PERCENT }}
+          MIN_TRADE_USDT=${{ vars.MIN_TRADE_USDT }}
+          STOP_LOSS_PERCENT=${{ vars.STOP_LOSS_PERCENT }}
+          TAKE_PROFIT_PERCENT=${{ vars.TAKE_PROFIT_PERCENT }}
+
+          # Initial Balance
+          INITIAL_BALANCE=${{ vars.INITIAL_BALANCE }}
+          EOF
+          echo "✅ .env file created"
+
       - name: Deploy to server
         env:
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -163,21 +194,21 @@ jobs:
           docker ps --filter "name=trading-bot"
           SCRIPT
 
-          echo "📤 Uploading deployment script..."
+          echo "📤 Uploading deployment script and .env file..."
           sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             deploy-docker.sh \
+            .env \
             $SERVER_USER@$SERVER_HOST:/tmp/
 
-          echo "🏗️ Setting up directory structure..."
+          echo "🏗️ Setting up directory structure and .env file..."
           sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             $SERVER_USER@$SERVER_HOST "
             mkdir -p /opt/trading-bot/{logs,data}
             chmod 755 /opt/trading-bot
-            if [ ! -f /opt/trading-bot/.env ]; then
-              echo '⚠️  Warning: .env file not found. Creating empty file at /opt/trading-bot/.env'
-              echo '# Add your environment variables here' > /opt/trading-bot/.env
-              chmod 600 /opt/trading-bot/.env
-            fi
+            # Копируем .env файл с правильными правами
+            cp /tmp/.env /opt/trading-bot/.env
+            chmod 600 /opt/trading-bot/.env
+            echo '✅ .env file deployed to /opt/trading-bot/.env'
           "
 
           echo "🚀 Executing deployment script..."
@@ -205,8 +236,11 @@ jobs:
             echo ''
             echo '📊 Trading bot logs (last 5 lines):'
             docker logs trading-bot --tail 5 2>/dev/null || echo '❌ Container not running or no logs yet'
+            echo ''
+            echo '🔐 Environment variables check (names only):'
+            docker exec trading-bot env | grep -E '(BYBIT|DEEPSEEK|TELEGRAM|TRADING|RISK|INITIAL)' | cut -d= -f1 | sort
           "
 
       - name: Cleanup
         run: |
-          rm -f deploy-docker.sh
+          rm -f deploy-docker.sh .env
