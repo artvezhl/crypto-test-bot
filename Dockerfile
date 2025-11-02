@@ -1,15 +1,28 @@
+# Используем официальный Python образ
 FROM python:3.11-slim
 
+# Устанавливаем системные зависимости
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Копируем зависимости
+# Копируем файлы зависимостей
 COPY requirements.txt .
+
+# Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Копируем исходный код
 COPY . .
 
-# Устанавливаем PM2
-RUN npm install -g pm2
+# Создаем пользователя для безопасности (опционально)
+RUN useradd -m -r trader && \
+    chown -R trader:trader /app
+USER trader
 
-CMD ["pm2-runtime", "main.py", "--name", "trading-bot"]
+# Запускаем бота
+CMD ["python", "-u", "main.py"]

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: trading-bot
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
