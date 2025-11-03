@@ -117,6 +117,7 @@ class Database:
         CREATE TABLE IF NOT EXISTS allowed_users (
             user_id BIGINT PRIMARY KEY,
             username VARCHAR(100),
+            is_admin BOOLEAN DEFAULT FALSE,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -146,7 +147,7 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_trade_logs_created_at ON trade_logs(created_at);
 
         -- Начальные настройки
-        INSERT INTO settings (key, value) VALUES 
+        INSERT INTO settings (key, value) VALUES
         ('symbol', 'ETHUSDT'),
         ('leverage', '10')
         ON CONFLICT (key) DO NOTHING;
@@ -186,8 +187,8 @@ class Database:
             # Проверяем существование основной таблицы
             check_query = """
             SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public'
                 AND table_name = 'positions'
             );
             """
@@ -202,6 +203,14 @@ class Database:
             else:
                 self.logger.info("✅ Таблицы PostgreSQL уже существуют")
 
+            add_admin_query = """
+            INSERT INTO allowed_users (user_id, username, is_admin) 
+            VALUES (86157241, 'admin', TRUE)
+            ON CONFLICT (user_id) DO UPDATE SET 
+                username = EXCLUDED.username,
+                is_admin = EXCLUDED.is_admin
+            """
+            self._execute_query(add_admin_query, fetch=False)
         except Exception as e:
             self.logger.error(f"❌ Ошибка инициализации PostgreSQL: {e}")
             raise
@@ -273,7 +282,7 @@ class Database:
             )
             ''',
             '''
-            INSERT OR IGNORE INTO settings (key, value) 
+            INSERT OR IGNORE INTO settings (key, value)
             VALUES ('symbol', 'ETHUSDT'), ('leverage', '10')
             '''
         ]
@@ -299,7 +308,7 @@ class Database:
         try:
             if self.db_type == 'postgresql':
                 query = """
-                SELECT 
+                SELECT
                     COUNT(*) as total_trades,
                     COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
                     COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
@@ -307,12 +316,12 @@ class Database:
                     AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
                     COUNT(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND pnl < 0 THEN 1 END) as losing_trades
-                FROM positions 
+                FROM positions
                 WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '%s days'
                 """
             else:
                 query = """
-                SELECT 
+                SELECT
                     COUNT(*) as total_trades,
                     COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
                     COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
@@ -320,7 +329,7 @@ class Database:
                     AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
                     COUNT(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND pnl < 0 THEN 1 END) as losing_trades
-                FROM positions 
+                FROM positions
                 WHERE created_at >= datetime('now', '-%s days')
                 """
 
@@ -480,13 +489,13 @@ class Database:
         # Обновляем позицию
         if self.db_type == 'postgresql':
             query = """
-            UPDATE positions 
+            UPDATE positions
             SET current_price = %s, pnl = %s, pnl_percent = %s, updated_at = CURRENT_TIMESTAMP
             WHERE id = %s
             """
         else:
             query = """
-            UPDATE positions 
+            UPDATE positions
             SET current_price = ?, pnl = ?, pnl_percent = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """
@@ -514,13 +523,13 @@ class Database:
 
         if self.db_type == 'postgresql':
             query = """
-            UPDATE positions 
+            UPDATE positions
             SET status = 'closed', current_price = %s, pnl = %s, pnl_percent = %s, updated_at = CURRENT_TIMESTAMP
             WHERE id = %s
             """
         else:
             query = """
-            UPDATE positions 
+            UPDATE positions
             SET status = 'closed', current_price = ?, pnl = ?, pnl_percent = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """
@@ -572,34 +581,38 @@ class Database:
     def set_setting(self, key: str, value: str):
         if self.db_type == 'postgresql':
             query = """
-            INSERT INTO settings (key, value, updated_at) 
+            INSERT INTO settings (key, value, updated_at)
             VALUES (%s, %s, CURRENT_TIMESTAMP)
             ON CONFLICT (key) DO UPDATE SET value = %s, updated_at = CURRENT_TIMESTAMP
             """
             params = (key, value, value)
         else:
             query = """
-            INSERT OR REPLACE INTO settings (key, value, updated_at) 
+            INSERT OR REPLACE INTO settings (key, value, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
             """
             params = (key, value, value)
 
         self._execute_query(query, params, fetch=False)
 
-    def add_allowed_user(self, user_id: int, username: str | None = None):
+    def add_allowed_user(self, user_id: int, username: str | None = None, is_admin: bool = False):
+        """Добавляет пользователя в белый список"""
+        params: tuple
         if self.db_type == 'postgresql':
             query = """
-            INSERT INTO allowed_users (user_id, username) 
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET username = %s
+            INSERT INTO allowed_users (user_id, username, is_admin)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = %s,
+                is_admin = %s
             """
-            params = (user_id, username, username)
+            params = (user_id, username, is_admin, username, is_admin)
         else:
             query = """
-            INSERT OR REPLACE INTO allowed_users (user_id, username) 
-            VALUES (?, ?)
+            INSERT OR REPLACE INTO allowed_users (user_id, username, is_admin)
+            VALUES (?, ?, ?)
             """
-            params = (user_id, username, username)
+            params = (user_id, username, is_admin)
 
         self._execute_query(query, params, fetch=False)
 
@@ -611,3 +624,70 @@ class Database:
 
         result = self._execute_query(query, (user_id,))
         return bool(result)
+
+    def get_all_users(self):
+        """Получить список всех пользователей"""
+        try:
+            if self.db_type == 'postgresql':
+                query = "SELECT user_id, username, is_admin FROM allowed_users"
+            else:
+                query = "SELECT user_id, username, is_admin FROM allowed_users"
+
+            result = self._execute_query(query, fetch=True)
+            return result if result else []
+        except Exception as e:
+            self.logger.error(f"Ошибка получения списка пользователей: {e}")
+            return []
+
+    def is_user_admin(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь администратором"""
+        try:
+            if self.db_type == 'postgresql':
+                query = "SELECT is_admin FROM allowed_users WHERE user_id = %s"
+            else:
+                query = "SELECT is_admin FROM allowed_users WHERE user_id = ?"
+
+            result = self._execute_query(query, (user_id,), fetch=True)
+            if result and len(result) > 0:
+                return bool(result[0]['is_admin'])
+            return False
+        except Exception as e:
+            self.logger.error(f"Ошибка проверки прав администратора: {e}")
+            return False
+
+    def set_user_admin(self, user_id: int, is_admin: bool):
+        """Устанавливает права администратора для пользователя"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                UPDATE allowed_users
+                SET is_admin = %s
+                WHERE user_id = %s
+                """
+            else:
+                query = """
+                UPDATE allowed_users
+                SET is_admin = ?
+                WHERE user_id = ?
+                """
+
+            params = (is_admin, user_id)
+            self._execute_query(query, params, fetch=False)
+            return True
+        except Exception as e:
+            self.logger.error(f"Ошибка установки прав администратора: {e}")
+            return False
+
+    def remove_user(self, user_id: int) -> bool:
+        """Удаляет пользователя из белого списка"""
+        try:
+            if self.db_type == 'postgresql':
+                query = "DELETE FROM allowed_users WHERE user_id = %s"
+            else:
+                query = "DELETE FROM allowed_users WHERE user_id = ?"
+
+            self._execute_query(query, (user_id,), fetch=False)
+            return True
+        except Exception as e:
+            self.logger.error(f"Ошибка удаления пользователя: {e}")
+            return False

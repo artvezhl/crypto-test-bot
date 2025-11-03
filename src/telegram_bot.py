@@ -48,6 +48,10 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("reverse", self._reverse))
         self.application.add_handler(CommandHandler("close", self._close))
 
+        # Команды администратора
+        self.application.add_handler(
+            CommandHandler("admin_users", self._admin_users))
+
         # В самом конце - обработчик для неизвестных команд
         self.application.add_handler(
             MessageHandler(filters.COMMAND, self._unknown))
@@ -77,8 +81,16 @@ class TelegramBot:
         user_id = update.effective_user.id
         username = update.effective_user.username or update.effective_user.first_name
 
-        # Автоматически добавляем пользователя при команде /start
-        self.db.add_allowed_user(user_id, username)
+        # Проверяем, есть ли пользователь в белом списке
+        if not self.db.is_user_allowed(user_id):
+            await self._send_message(
+                update,
+                "❌ Доступ запрещен.\n\n"
+                "Ваш user ID не найден в списке разрешенных пользователей.\n"
+                f"Ваш ID: {user_id}\n"
+                "Обратитесь к администратору для получения доступа."
+            )
+            return
 
         await self._send_message(
             update,
@@ -92,6 +104,100 @@ class TelegramBot:
             "/settings - текущие настройки\n"
             # "/set_symbol - изменить торговую пару"
         )
+
+    async def _admin_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для управления пользователями (только для админов)"""
+        if not update.effective_user:
+            return
+
+        user_id = update.effective_user.id
+
+        # Проверяем, является ли пользователь администратором
+        if not self.db.is_user_admin(user_id):
+            await self._send_message(update, "❌ Эта команда доступна только администраторам.")
+            return
+
+        if not context.args:
+            # Показываем список пользователей
+            users = self.db.get_all_users()
+            if not users:
+                await self._send_message(update, "📝 Список пользователей пуст.")
+                return
+
+            message = "👥 *Список пользователей:*\n\n"
+            for user in users:
+                status = "🟢 Админ" if user.get(
+                    'is_admin') else "🔵 Пользователь"
+                message += (
+                    f"👤 *{user['username']}*\n"
+                    f"🆔 ID: `{user['user_id']}`\n"
+                    f"📊 {status}\n"
+                    f"📅 Добавлен: {user['created_at'][:10]}\n"
+                    f"────────────────────\n"
+                )
+
+            message += "\nКоманды управления:\n"
+            message += "• `/admin_users add <user_id> <username>` - добавить пользователя\n"
+            message += "• `/admin_users remove <user_id>` - удалить пользователя\n"
+            message += "• `/admin_users admin <user_id>` - сделать администратором\n"
+            message += "• `/admin_users user <user_id>` - убрать права администратора\n"
+
+            await self._send_message(update, message, parse_mode='Markdown')
+            return
+
+        command = context.args[0].lower()
+
+        if command == 'add' and len(context.args) >= 3:
+            try:
+                new_user_id = int(context.args[1])
+                new_username = ' '.join(context.args[2:])
+
+                if self.db.add_allowed_user(new_user_id, new_username):
+                    await self._send_message(update, f"✅ Пользователь {new_username} (ID: {new_user_id}) добавлен.")
+                else:
+                    await self._send_message(update, "❌ Ошибка при добавлении пользователя.")
+
+            except ValueError:
+                await self._send_message(update, "❌ Неверный формат user_id.")
+
+        elif command == 'remove' and len(context.args) >= 2:
+            try:
+                remove_user_id = int(context.args[1])
+
+                if self.db.remove_user(remove_user_id):
+                    await self._send_message(update, f"✅ Пользователь (ID: {remove_user_id}) удален.")
+                else:
+                    await self._send_message(update, "❌ Пользователь не найден.")
+
+            except ValueError:
+                await self._send_message(update, "❌ Неверный формат user_id.")
+
+        elif command == 'admin' and len(context.args) >= 2:
+            try:
+                admin_user_id = int(context.args[1])
+
+                if self.db.set_user_admin(admin_user_id, True):
+                    await self._send_message(update, f"✅ Пользователь (ID: {admin_user_id}) назначен администратором.")
+                else:
+                    await self._send_message(update, "❌ Пользователь не найден.")
+
+            except ValueError:
+                await self._send_message(update, "❌ Неверный формат user_id.")
+
+        elif command == 'user' and len(context.args) >= 2:
+            try:
+                user_user_id = int(context.args[1])
+
+                if self.db.set_user_admin(user_user_id, False):
+                    await self._send_message(update, f"✅ Пользователь (ID: {user_user_id}) лишен прав администратора.")
+                else:
+                    await self._send_message(update, "❌ Пользователь не найден.")
+
+            except ValueError:
+                await self._send_message(update, "❌ Неверный формат user_id.")
+
+        else:
+            await self._send_message(update, "❌ Неверная команда. Используйте /admin_users для справки.")
 
     async def _balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /balance"""

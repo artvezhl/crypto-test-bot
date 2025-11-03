@@ -139,15 +139,8 @@ class TradingBot:
             self.logger.error(f"❌ Ошибка обработки обновления ордера: {e}")
 
     def _send_position_closed_notification(self, position: Dict, close_price: float):
-        """Отправка уведомления о закрытии позиции"""
+        """Отправка уведомления о закрытии позиции всем пользователям"""
         try:
-            import requests
-            from config import Config
-
-            token = Config.TELEGRAM_BOT_TOKEN
-            if not token or token == "your_telegram_token":
-                return
-
             # Рассчитываем PnL
             pnl = (close_price - position['entry_price']) * position['size']
             pnl_percent = (
@@ -177,14 +170,8 @@ class TradingBot:
             📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
             """
 
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                'chat_id': Config.TELEGRAM_CHAT_ID,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-
-            requests.post(url, json=payload, timeout=10)
+            # Отправляем сообщение всем пользователям
+            self._broadcast_message(message)
 
         except Exception as e:
             self.logger.warning(
@@ -517,16 +504,8 @@ class TradingBot:
                     f"✅ Позиция #{position_id} закрыта по причине: {reason}")
 
     def _send_trade_notification(self, action: str, position_id: int, signal: Dict, entry_price: float):
-        """Отправляет уведомление о сделке в Telegram"""
+        """Отправляет уведомление о сделке всем пользователям бота"""
         try:
-            import requests
-            from config import Config
-
-            token = Config.TELEGRAM_BOT_TOKEN
-
-            if not token or token == "your_telegram_token":
-                return
-
             # Получаем информацию о балансе
             arrow, balance_change, balance_change_percent, highest, lowest = self.get_balance_change_info()
             trading_balance = self.balance_info.get('total_equity', 0)
@@ -566,20 +545,60 @@ class TradingBot:
                 📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
                 """
 
-            # Отправляем сообщение через Telegram API
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-            payload = {
-                'chat_id': Config.TELEGRAM_CHAT_ID,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-
-            requests.post(url, json=payload, timeout=10)
+            # Отправляем сообщение всем пользователям
+            self._broadcast_message(message)
 
         except Exception as e:
             self.logger.warning(
                 f"Не удалось отправить уведомление о сделке: {e}")
+
+    def _broadcast_message(self, message: str, parse_mode: str = 'Markdown'):
+        """Рассылает сообщение всем пользователям бота"""
+        try:
+            import requests
+            from config import Config
+
+            token = Config.TELEGRAM_BOT_TOKEN
+            if not token or token == "your_telegram_token":
+                return
+
+            # Получаем всех пользователей из базы
+            users = self.db.get_all_users()
+            if not users:
+                self.logger.warning("Нет пользователей для рассылки")
+                return
+
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+            successful_sends = 0
+            failed_sends = 0
+
+            for user in users:
+                try:
+                    payload = {
+                        'chat_id': user['user_id'],
+                        'text': message,
+                        'parse_mode': parse_mode
+                    }
+
+                    response = requests.post(url, json=payload, timeout=10)
+                    if response.status_code == 200:
+                        successful_sends += 1
+                    else:
+                        failed_sends += 1
+                        self.logger.warning(
+                            f"Не удалось отправить сообщение пользователю {user['user_id']}: {response.text}")
+
+                except Exception as e:
+                    failed_sends += 1
+                    self.logger.warning(
+                        f"Ошибка отправки пользователю {user['user_id']}: {e}")
+
+            self.logger.info(
+                f"📢 Рассылка завершена: успешно {successful_sends}, ошибок {failed_sends}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка при рассылке сообщений: {e}")
 
     def _get_moscow_time(self):
         """Возвращает текущее время по Москве"""
