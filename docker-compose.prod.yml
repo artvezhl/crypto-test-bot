@@ -46,6 +46,8 @@ services:
       POSTGRES_DB: trading_bot
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: password
+    ports:
+      - "127.0.0.1:5432:5432"     # <— публикуем порт только на loopback хоста
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d
