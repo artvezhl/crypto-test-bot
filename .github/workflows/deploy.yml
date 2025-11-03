@@ -251,31 +251,32 @@ jobs:
             sudo apt-get update && sudo apt-get install -y sshpass
           fi
           
-          # Создаем скрипт деплоя с явным указанием пути
+          # Создаем скрипт деплоя с исправленным логином Docker
           cat > deploy.sh << 'SCRIPT'
           #!/bin/bash
           set -e
           echo "🔧 Starting deployment on server..."
           
           # Создаем директории
-          mkdir -p /opt/trading-bot/{compose,logs,data,backups,init-db}
+          mkdir -p /opt/trading-bot/{logs,data,backups,init-db}
           sudo chown -R $USER:$USER /opt/trading-bot
           
           # Копируем файлы
-          cp /tmp/docker-compose.prod.yml /opt/trading-bot/docker-compose.yml  # Копируем прямо в корень
+          cp /tmp/docker-compose.prod.yml /opt/trading-bot/docker-compose.yml
           cp /tmp/.env.production /opt/trading-bot/.env
           cp /tmp/init.sql /opt/trading-bot/init-db/ 2>/dev/null || true
           chmod 600 /opt/trading-bot/.env
           
-          cd /opt/trading-bot  # Переходим в директорию с docker-compose.yml
+          cd /opt/trading-bot
           
-          # Логинимся в GitHub Registry
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+          # Логинимся в GitHub Registry БЕЗ интерактивного режима
+          echo "🔐 Logging into GitHub Container Registry..."
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin > /dev/null 2>&1
           
-          # Используем Docker Compose V2 (docker compose) с явным указанием файла
-          docker compose -f docker-compose.yml down 2>/dev/null || true
-          docker compose -f docker-compose.yml pull
-          docker compose -f docker-compose.yml up -d
+          # Используем Docker Compose
+          docker compose down 2>/dev/null || true
+          docker compose pull
+          docker compose up -d
           
           echo "✅ Deployment completed!"
           SCRIPT
