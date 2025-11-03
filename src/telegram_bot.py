@@ -45,6 +45,7 @@ class TelegramBot:
             CommandHandler("close_all", self._close_all))
         self.application.add_handler(
             CommandHandler("settings", self._settings))
+        self.application.add_handler(CommandHandler("reverse", self._reverse))
         self.application.add_handler(CommandHandler("close", self._close))
 
         # В самом конце - обработчик для неизвестных команд
@@ -87,6 +88,7 @@ class TelegramBot:
             "/positions - открытые позиции\n"
             "/close [id] - закрыть позицию по ID\n"
             "/close_all - закрыть все позиции\n"
+            "/reverse - принудительный переворот позиций\n"
             "/settings - текущие настройки\n"
             # "/set_symbol - изменить торговую пару"
         )
@@ -134,7 +136,11 @@ class TelegramBot:
 
         message = "📋 *Открытые позиции:*\n\n"
         for pos in open_positions:
+            direction_emoji = "🟢" if pos['side'] == 'BUY' else "🔴"
+            direction_text = "ЛОНГ" if pos['side'] == 'BUY' else "ШОРТ"
+
             message += (
+                f"{direction_emoji} *{direction_text}*\n"
                 f"🆔 *ID:* {pos['id']}\n"
                 f"💹 *Символ:* {pos['symbol']}\n"
                 f"📊 *Сторона:* {pos['side']}\n"
@@ -349,6 +355,59 @@ class TelegramBot:
             context.user_data.clear()
 
         return ConversationHandler.END
+
+    async def _reverse(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Принудительный переворот позиции"""
+        if not update.effective_user:
+            return
+
+        user_id = update.effective_user.id
+        if not self.db.is_user_allowed(user_id):
+            await self._send_message(update, "❌ Доступ запрещен. Используйте /start для активации.")
+            return
+
+        open_positions = self.db.get_open_positions()
+        if not open_positions:
+            await self._send_message(update, "📭 Нет открытых позиций для переворота.")
+            return
+
+        position = open_positions[0]
+        market_data = self.trading_bot.bybit.get_market_data(
+            position['symbol'])
+        if not market_data:
+            await self._send_message(update, "❌ Ошибка получения рыночных данных.")
+            return
+
+        # Закрываем текущую позицию
+        success = self.trading_bot.bybit.close_position(
+            position['symbol'], position['side'])
+        if success:
+            self.db.close_position(position['id'], market_data['price'])
+            await self._send_message(update, f"✅ Позиция #{position['id']} закрыта для переворота.")
+
+            # Открываем противоположную позицию
+            new_side = "Sell" if position['side'] == 'BUY' else "Buy"
+            position_amount = self.trading_bot.calculate_position_size(
+                market_data['price'])
+
+            if new_side == "Buy":
+                self.trading_bot._execute_buy(
+                    {'action': 'BUY', 'confidence': 1.0,
+                        'reason': 'Manual reversal'},
+                    market_data,
+                    position_amount
+                )
+            else:
+                self.trading_bot._execute_sell(
+                    {'action': 'SELL', 'confidence': 1.0,
+                        'reason': 'Manual reversal'},
+                    market_data,
+                    position_amount
+                )
+
+            await self._send_message(update, f"✅ Открыта противоположная позиция ({new_side})")
+        else:
+            await self._send_message(update, f"❌ Ошибка закрытия позиции для переворота.")
 
     async def _cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отмена операции"""

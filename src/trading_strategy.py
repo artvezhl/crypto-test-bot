@@ -334,13 +334,14 @@ class TradingBot:
             self.db.update_position_price(position['id'], current_price)
 
     def _check_trailing_stops(self, current_price: float):
-        """Проверка условий для скользящих стоп-лоссов"""
+        """Проверка условий для скользящих стоп-лоссов для обоих направлений"""
         open_positions = self.db.get_open_positions()
 
         for position in open_positions:
             position_id = position['id']
             entry_price = position['entry_price']
             current_sl = position['stop_loss']
+            current_tp = position['take_profit']
             side = position['side']
 
             if side == "BUY":
@@ -349,14 +350,16 @@ class TradingBot:
                     new_sl = entry_price * (1 + 0.005)  # +0.5% от цены входа
                     if not current_sl or new_sl > current_sl:
                         self.db.update_stop_loss(position_id, new_sl)
+                        self.logger.info(
+                            f"📈 Обновлен стоп-лосс для лонга: {new_sl:.2f}")
 
-                    # Проверяем достижение стоп-лосса или тейк-профита
-                    if current_sl and current_price <= current_sl:
-                        self._close_position_by_id(
-                            position_id, current_price, "stop_loss")
-                    elif position['take_profit'] and current_price >= position['take_profit']:
-                        self._close_position_by_id(
-                            position_id, current_price, "take_profit")
+                # Проверяем достижение стоп-лосса или тейк-профита
+                if current_sl and current_price <= current_sl:
+                    self._close_position_by_id(
+                        position_id, current_price, "stop_loss")
+                elif current_tp and current_price >= current_tp:
+                    self._close_position_by_id(
+                        position_id, current_price, "take_profit")
 
             else:  # SELL
                 # Для шортов: опускаем стоп-лосс когда цена падает
@@ -364,25 +367,67 @@ class TradingBot:
                     new_sl = entry_price * (1 - 0.005)  # -0.5% от цены входа
                     if not current_sl or new_sl < current_sl:
                         self.db.update_stop_loss(position_id, new_sl)
+                        self.logger.info(
+                            f"📉 Обновлен стоп-лосс для шорта: {new_sl:.2f}")
 
-                    # Проверяем достижение стоп-лосса или тейк-профита
-                    if current_sl and current_price >= current_sl:
-                        self._close_position_by_id(
-                            position_id, current_price, "stop_loss")
-                    elif position['take_profit'] and current_price <= position['take_profit']:
-                        self._close_position_by_id(
-                            position_id, current_price, "take_profit")
+                # Проверяем достижение стоп-лосса или тейк-профита
+                if current_sl and current_price >= current_sl:
+                    self._close_position_by_id(
+                        position_id, current_price, "stop_loss")
+                elif current_tp and current_price <= current_tp:
+                    self._close_position_by_id(
+                        position_id, current_price, "take_profit")
 
     def _execute_trading_decision(self, signal: Dict, market_data: Dict, position_amount: float):
-        """Исполняет торговое решение"""
+        """Исполняет торговое решение с поддержкой обоих направлений"""
         try:
-            if signal['action'] == 'BUY' and not self._has_open_position():
-                self._execute_buy(signal, market_data, position_amount)
-            elif signal['action'] == 'SELL' and not self._has_open_position():
-                self._execute_sell(signal, market_data, position_amount)
+            current_positions = self.db.get_open_positions()
+            has_position = len(current_positions) > 0
+
+            if signal['action'] == 'BUY':
+                if not has_position:
+                    # Нет позиций - открываем лонг
+                    self._execute_buy(signal, market_data, position_amount)
+                else:
+                    # Есть позиция - проверяем направление
+                    current_position = current_positions[0]
+                    if current_position['side'] == 'SELL':
+                        # Закрываем шорт и открываем лонг
+                        self.logger.info("🔄 Переворот позиции: SELL → BUY")
+                        self._close_position_by_id(
+                            current_position['id'], market_data['price'], "reversal")
+                        # Даем время на закрытие перед открытием новой позиции
+                        time.sleep(1)
+                        self._execute_buy(signal, market_data, position_amount)
+                    # Если уже в лонге - ничего не делаем
+
+            elif signal['action'] == 'SELL':
+                if not has_position:
+                    # Нет позиций - открываем шорт
+                    self._execute_sell(signal, market_data, position_amount)
+                else:
+                    # Есть позиция - проверяем направление
+                    current_position = current_positions[0]
+                    if current_position['side'] == 'BUY':
+                        # Закрываем лонг и открываем шорт
+                        self.logger.info("🔄 Переворот позиции: BUY → SELL")
+                        self._close_position_by_id(
+                            current_position['id'], market_data['price'], "reversal")
+                        # Даем время на закрытие перед открытием новой позиции
+                        time.sleep(1)
+                        self._execute_sell(
+                            signal, market_data, position_amount)
+                    # Если уже в шорте - ничего не делаем
 
         except Exception as e:
             self.logger.error(f"❌ Ошибка исполнения сделки: {e}")
+
+    def get_current_position_direction(self) -> Optional[str]:
+        """Возвращает направление текущей позиции или None если позиций нет"""
+        positions = self.db.get_open_positions()
+        if positions:
+            return positions[0]['side']
+        return None
 
     def _execute_buy(self, signal: Dict, market_data: Dict, position_amount: float):
         """Исполняет покупку"""
@@ -495,27 +540,31 @@ class TradingBot:
 
             moscow_time = self._get_moscow_time()
 
+            # Определяем эмодзи для направления
+            direction_emoji = "🟢" if position['side'] == 'BUY' else "🔴"
+            direction_text = "ЛОНГ" if position['side'] == 'BUY' else "ШОРТ"
+
             message = f"""
-{action}
+                {direction_emoji} *{action} - {direction_text}*
 
-🆔 *ID позиции:* #{position_id}
-💹 *Символ:* {position['symbol']}
-💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
-{arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
-📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
-💵 *Размер позиции:* {position['size']:.4f}
-🔢 *Леверидж:* {position['leverage']}x
-💸 *Цена входа:* ${entry_price:.2f}
-📉 *Стоп-лосс:* ${position.get('stop_loss', 0):.2f}
-📈 *Тейк-профит:* ${position.get('take_profit', 0):.2f}
+                🆔 *ID позиции:* #{position_id}
+                💹 *Символ:* {position['symbol']}
+                💰 *Текущий баланс:* {trading_balance:.2f} USDT ({balance_source})
+                {arrow} *Изменение:* {balance_change:+.2f} USDT ({balance_change_percent:+.2f}%)
+                📊 *Начальный баланс:* {self.initial_balance:.2f} USDT
+                💵 *Размер позиции:* {position['size']:.4f}
+                🔢 *Леверидж:* {position['leverage']}x
+                💸 *Цена входа:* ${entry_price:.2f}
+                📉 *Стоп-лосс:* ${position.get('stop_loss', 0):.2f}
+                📈 *Тейк-профит:* ${position.get('take_profit', 0):.2f}
 
-🎯 *Сигнал AI:* {signal.get('action', 'N/A')}
-⭐ *Уверенность:* {signal.get('confidence', 0):.2f}
-💭 *Причина:* {signal.get('reason', 'N/A')}
+                🎯 *Сигнал AI:* {signal.get('action', 'N/A')}
+                ⭐ *Уверенность:* {signal.get('confidence', 0):.2f}
+                💭 *Причина:* {signal.get('reason', 'N/A')}
 
-⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
-"""
+                ⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
+                📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
+                """
 
             # Отправляем сообщение через Telegram API
             url = f"https://api.telegram.org/bot{token}/sendMessage"

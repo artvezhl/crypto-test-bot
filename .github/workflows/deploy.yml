@@ -240,118 +240,183 @@ jobs:
 
       - name: Deploy to production server
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
         run: |
           set -e
           echo "🚀 Starting production deployment..."
 
-          # Создаем SSH ключ
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          # Устанавливаем sshpass если нужно
+          if ! command -v sshpass &> /dev/null; then
+            echo "📦 Installing sshpass..."
+            sudo apt-get update && sudo apt-get install -y sshpass
+          fi
 
           # Создаем скрипт деплоя
           cat > deploy.sh << 'SCRIPT'
           #!/bin/bash
           set -e
+          echo "🔧 Starting deployment on server..."
 
-          echo "🔧 Setting up deployment environment..."
-          
           # Создаем директории
-          sudo mkdir -p /opt/trading-bot/{compose,logs,data,backups}
-          sudo chown -R $SERVER_USER:$SERVER_USER /opt/trading-bot
-          sudo chmod 755 /opt/trading-bot
-
-          # Копируем файлы
+          sudo mkdir -p /opt/trading-bot/{compose,logs,data,backups,init-db}
+          sudo chown -R $USER:$USER /opt/trading-bot
+          
+          # Копируем файлы (уже должны быть в /tmp)
           cp /tmp/docker-compose.prod.yml /opt/trading-bot/compose/docker-compose.yml
           cp /tmp/.env.production /opt/trading-bot/.env
-          chmod 600 /opt/trading-bot/.env
-
-          echo "🐳 Setting up Docker..."
-          if ! command -v docker &> /dev/null; then
-            echo "Installing Docker..."
-            curl -fsSL https://get.docker.com -o get-docker.sh
-            sudo sh get-docker.sh
-            sudo usermod -aG docker $USER
-          fi
-
-          echo "📦 Setting up Docker Compose..."
-          if ! command -v docker-compose &> /dev/null; then
-            sudo curl -L "https://github.com/docker/compose/releases/download/v$DOCKER_COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-          fi
+          cp /tmp/init.sql /opt/trading-bot/init-db/ 2>/dev/null || true
+          sudo chmod 600 /opt/trading-bot/.env
 
           cd /opt/trading-bot
 
-          echo "🔐 Logging into GitHub Container Registry..."
+          # Логинимся в GitHub Registry
           echo "$GITHUB_TOKEN" | sudo docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
 
-          echo "📥 Pulling latest image..."
-          sudo docker-compose pull
+          # Останавливаем старый контейнер если есть
+          sudo docker-compose down 2>/dev/null || true
 
-          echo "🔄 Starting services..."
+          # Пуллим и запускаем новый
+          sudo docker-compose pull
           sudo docker-compose up -d
 
-          echo "🧹 Cleaning up..."
-          sudo docker system prune -f
-
-          echo "✅ Deployment completed!"
+          echo "✅ Deployment completed on server!"
           SCRIPT
 
           chmod +x deploy.sh
 
-          # Копируем файлы на сервер
+          # Создаем init.sql если его нет
+          if [ ! -f "init-db/init.sql" ]; then
+            mkdir -p init-db
+            cat > init-db/init.sql << 'SQL'
+          CREATE TABLE IF NOT EXISTS positions (
+            id SERIAL PRIMARY KEY,
+            symbol VARCHAR(20) NOT NULL,
+            -- добавьте остальные поля по необходимости
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          SQL
+          fi
+
           echo "📤 Uploading files to server..."
-          scp -o StrictHostKeyChecking=no \
+          sshpass -p "$SERVER_PASSWORD" scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
             docker-compose.prod.yml \
             .env.production \
             deploy.sh \
+            init-db/init.sql \
             $SERVER_USER@$SERVER_HOST:/tmp/
 
-          # Запускаем деплой
           echo "🏗️ Executing deployment..."
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
+          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+            $SERVER_USER@$SERVER_HOST "
             export GITHUB_TOKEN='${{ secrets.GITHUB_TOKEN }}'
             export GITHUB_ACTOR='${{ github.actor }}'
             export DOCKER_COMPOSE_VERSION='${{ env.DOCKER_COMPOSE_VERSION }}'
             chmod +x /tmp/deploy.sh
-            /tmp/deploy.sh
+            cd /tmp && ./deploy.sh
           "
 
       - name: Verify deployment
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
         run: |
           set -e
           echo "🔍 Verifying deployment..."
           
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          # Устанавливаем sshpass если нужно
+          if ! command -v sshpass &> /dev/null; then
+            echo "📦 Installing sshpass..."
+            sudo apt-get update && sudo apt-get install -y sshpass
+          fi
 
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "
-            echo '📊 Deployment Status:'
+          echo "📊 Checking deployment status..."
+          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+            $SERVER_USER@$SERVER_HOST "
+            echo '==================='
+            echo '🚀 DEPLOYMENT STATUS'
             echo '==================='
             
             echo ''
-            echo '🐳 Docker Containers:'
-            sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            echo '🐳 Docker Containers Status:'
+            sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -10
             
             echo ''
-            echo '📈 Trading Bot Logs:'
-            sudo docker logs trading-bot --tail 10 2>/dev/null || echo 'No logs yet'
+            echo '📈 Trading Bot Logs (last 10 lines):'
+            sudo docker logs trading-bot --tail 10 2>/dev/null || echo '⚠️  Trading bot container not running or no logs yet'
+            
+            echo ''
+            echo '🗄️  PostgreSQL Logs (last 5 lines):'
+            sudo docker logs trading-postgres --tail 5 2>/dev/null || echo '⚠️  PostgreSQL container not running or no logs yet'
             
             echo ''
             echo '💾 Disk Usage:'
             df -h /opt/trading-bot
             
             echo ''
-            echo '🔍 Service Health:'
-            sudo docker inspect --format='{{.State.Health.Status}}' trading-bot 2>/dev/null || echo 'No health check'
+            echo '🧠 Memory Usage:'
+            free -h
+            
+            echo ''
+            echo '🔍 Service Health Checks:'
+            echo '- Trading Bot:'
+            sudo docker inspect --format='{{.State.Health.Status}}' trading-bot 2>/dev/null || echo 'No health check configured'
+            echo '- PostgreSQL:'
+            sudo docker inspect --format='{{.State.Health.Status}}' trading-postgres 2>/dev/null || echo 'No health check configured'
+            
+            echo ''
+            echo '📦 Docker Image Versions:'
+            sudo docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' | grep ghcr.io || echo 'No GHCR images found'
+            
+            echo ''
+            echo '🌐 Network Connections:'
+            sudo netstat -tulpn | grep -E ':(5432|8000)' || echo 'No services listening on expected ports'
+            
+            echo ''
+            echo '✅ Verification completed'
+          "
+
+      - name: Check application health
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          echo "🏥 Performing health checks..."
+          
+          # Проверяем, что контейнеры запущены
+          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+            $SERVER_USER@$SERVER_HOST "
+            echo '🔍 Checking if containers are running...'
+            
+            # Проверяем trading-bot
+            if sudo docker ps --filter 'name=trading-bot' --format '{{.Names}}' | grep -q 'trading-bot'; then
+              echo '✅ Trading Bot container is running'
+            else
+              echo '❌ Trading Bot container is NOT running'
+              exit 1
+            fi
+            
+            # Проверяем postgres
+            if sudo docker ps --filter 'name=trading-postgres' --format '{{.Names}}' | grep -q 'trading-postgres'; then
+              echo '✅ PostgreSQL container is running'
+            else
+              echo '❌ PostgreSQL container is NOT running'
+              exit 1
+            fi
+            
+            # Проверяем, что бот работает (нет постоянных крашей)
+            RESTART_COUNT=\$(sudo docker inspect --format='{{.RestartCount}}' trading-bot 2>/dev/null || echo '0')
+            echo \"🔄 Trading Bot restart count: \$RESTART_COUNT\"
+            
+            if [ \"\$RESTART_COUNT\" -gt 3 ]; then
+              echo '❌ Trading Bot is restarting too frequently'
+              exit 1
+            fi
+            
+            echo '🎉 All health checks passed!'
           "
 
       - name: Send deployment notification

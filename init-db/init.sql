@@ -53,11 +53,22 @@ CREATE TABLE IF NOT EXISTS balance_history (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Таблица логов торговли
+CREATE TABLE IF NOT EXISTS trade_logs (
+    id SERIAL PRIMARY KEY,
+    level VARCHAR(20) NOT NULL,
+    message TEXT NOT NULL,
+    symbol VARCHAR(20),
+    position_id INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Индексы для улучшения производительности
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_balance_history_timestamp ON balance_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_created_at ON trade_logs(created_at);
 
 -- Начальные настройки
 INSERT INTO settings (key, value) VALUES 
