@@ -21,6 +21,9 @@ class VirtualTradingBot:
             self.deepseek = DeepSeekClient(self.db)
             self.bybit = BybitClient()
 
+            # Инициализируем настройки по умолчанию в БД при первом запуске
+            self._initialize_default_settings()
+
             # Загружаем настройки из БД
             self._load_settings_from_db()
 
@@ -45,6 +48,55 @@ class VirtualTradingBot:
         except Exception as e:
             self.logger.error(f"❌ Ошибка инициализации VirtualTradingBot: {e}")
             raise
+
+    def _initialize_default_settings(self):
+        """Инициализация настроек по умолчанию в базе данных"""
+        default_settings = {
+            # Торговые настройки
+            'trading_symbols': 'ETHUSDT,BTCUSDT,SOLUSDT',
+            'default_symbol': 'ETHUSDT',
+            'min_confidence': '0.68',
+            'leverage': '5',
+
+            # Риск-менеджмент
+            'risk_percent': '2.0',
+            'max_position_percent': '20.0',
+            'max_total_position_percent': '30.0',
+            'min_trade_usdt': '10.0',
+            'stop_loss_percent': '2.0',
+            'take_profit_percent': '4.0',
+
+            # Трейлинг-стоп
+            'trailing_stop_activation_percent': '0.5',
+            'trailing_stop_distance_percent': '0.3',
+
+            # Баланс
+            'initial_balance': '10000.0',
+
+            # Уведомления
+            'enable_notifications': 'true',
+            'enable_trade_logging': 'true',
+
+            # Поведение торговли
+            'allow_short_positions': 'true',
+            'allow_long_positions': 'true',
+            'auto_position_reversal': 'true',
+
+            # DeepSeek настройки
+            'deepseek_model': 'deepseek-reasoner',
+            'deepseek_max_tokens': '5000',
+            'deepseek_temperature': '1',
+
+            # Интервал торговли
+            'trading_interval_minutes': '15'
+        }
+
+        for key, value in default_settings.items():
+            current_value = self.db.get_setting(key)
+            if not current_value:
+                self.db.set_setting(key, value)
+                self.logger.info(
+                    f"📝 Инициализирована настройка {key} = {value}")
 
     def _load_settings_from_db(self):
         """Загрузка всех настроек из базы данных"""
