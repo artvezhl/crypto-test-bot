@@ -7,13 +7,16 @@ from database import Database
 import json
 from datetime import datetime
 
+from virtual_trading_bot import VirtualTradingBot
+
 # Состояния для ConversationHandler
 SET_SYMBOL, SET_LEVERAGE = range(2)
 
 
 class TelegramBot:
     def __init__(self, trading_bot: TradingBot):
-        self.trading_bot = trading_bot
+        self.trading_bot = VirtualTradingBot()
+        # self.trading_bot = trading_bot
         self.db = Database()
         self.logger = logging.getLogger(__name__)
 
@@ -45,12 +48,19 @@ class TelegramBot:
             CommandHandler("close_all", self._close_all))
         self.application.add_handler(
             CommandHandler("settings", self._settings))
-        self.application.add_handler(CommandHandler("reverse", self._reverse))
         self.application.add_handler(CommandHandler("close", self._close))
+        self.application.add_handler(CommandHandler("reverse", self._reverse))
+
+        # Команды для настроек
+        self.application.add_handler(CommandHandler("set", self._set_setting))
+        self.application.add_handler(CommandHandler(
+            "set_setting", self._set_setting))  # Альтернативная команда
 
         # Команды администратора
         self.application.add_handler(
             CommandHandler("admin_users", self._admin_users))
+        self.application.add_handler(CommandHandler(
+            "reset_settings", self._reset_settings))
 
         # В самом конце - обработчик для неизвестных команд
         self.application.add_handler(
@@ -94,15 +104,22 @@ class TelegramBot:
 
         await self._send_message(
             update,
-            "🤖 Торговый бот запущен.\n\n"
-            "Доступные команды:\n"
-            "/balance - текущий баланс\n"
-            "/positions - открытые позиции\n"
-            "/close [id] - закрыть позицию по ID\n"
-            "/close_all - закрыть все позиции\n"
-            "/reverse - принудительный переворот позиций\n"
-            "/settings - текущие настройки\n"
-            # "/set_symbol - изменить торговую пару"
+            "🤖 *Торговый бот запущен*\n\n"
+            "*Основные команды:*\n"
+            "• /balance - текущий баланс\n"
+            "• /positions - открытые позиции\n"
+            "• /close [id] - закрыть позицию по ID\n"
+            "• /close_all - закрыть все позиции\n"
+            "• /reverse - переворот позиции\n\n"
+            "*Настройки:*\n"
+            "• /settings - текущие настройки\n\n"
+            "*Администратор:*\n"
+            "• /set [ключ] [значение] - изменить настройку\n"
+            "• /set_symbol - изменить торговую пару\n"
+            "• /admin_users - управление пользователями\n"
+            "• /reset_settings - сброс настроек\n\n"
+            "Используйте /settings для просмотра всех доступных настроек.",
+            parse_mode='Markdown'
         )
 
     async def _admin_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,33 +354,182 @@ class TelegramBot:
         await self._send_message(update, f"✅ Закрыто позиций: {closed_count}/{len(open_positions)}")
 
     async def _settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /settings"""
+        """Показ всех текущих настроек"""
         if not update.effective_user:
             return
 
         user_id = update.effective_user.id
         if not self.db.is_user_allowed(user_id):
-            await self._send_message(update, "❌ Доступ запрещен. Используйте /start для активации.")
+            await self._send_message(update, "❌ Доступ запрещен.")
             return
 
-        symbol = self.db.get_setting('symbol', Config.DEFAULT_SYMBOL)
-        leverage = self.db.get_setting('leverage', '10')
-        risk_percent = self.trading_bot.risk_percent
-        stop_loss_percent = self.trading_bot.stop_loss_percent
-        take_profit_percent = self.trading_bot.take_profit_percent
+        # Получаем все настройки из бота
+        settings = self.trading_bot.get_all_settings()
 
-        message = (
-            f"⚙️ *Текущие настройки:*\n"
-            f"• *Торговая пара:* {symbol}\n"
-            f"• *Леверидж:* {leverage}x\n"
-            f"• *Риск на сделку:* {risk_percent}%\n"
-            f"• *Стоп-лосс:* {stop_loss_percent}%\n"
-            f"• *Тейк-профит:* {take_profit_percent}%\n"
-            f"• *Мин. уверенность:* {self.trading_bot.min_confidence}\n\n"
-            f"Изменить пару: `/set_symbol`"
-        )
+        message = "⚙️ *Текущие настройки:*\n\n"
+
+        # Группируем настройки для лучшего отображения
+        categories = {
+            '📊 Торговые настройки': [
+                'trading_symbols', 'default_symbol', 'min_confidence', 'leverage',
+                'trading_interval_minutes'
+            ],
+            '🛡️ Риск-менеджмент': [
+                'risk_percent', 'max_position_percent', 'max_total_position_percent',
+                'min_trade_usdt', 'stop_loss_percent', 'take_profit_percent',
+                'trailing_stop_activation_percent', 'trailing_stop_distance_percent'
+            ],
+            '🔧 Поведение': [
+                'allow_short_positions', 'allow_long_positions', 'auto_position_reversal'
+            ],
+            '🔔 Уведомления': [
+                'enable_notifications', 'enable_trade_logging'
+            ],
+            '🤖 DeepSeek': [
+                'deepseek_model', 'deepseek_max_tokens', 'deepseek_temperature',
+                'enable_deepseek_reasoning'
+            ],
+            '💰 Баланс': [
+                'initial_balance'
+            ]
+        }
+
+        for category, keys in categories.items():
+            message += f"*{category}:*\n"
+            for key in keys:
+                if key in settings:
+                    value = settings[key]
+                    # Сокращаем длинные значения
+                    if key == 'trading_symbols' and len(value) > 50:
+                        value = value[:50] + "..."
+                    message += f"• `{key}: {value}`\n"
+            message += "\n"
+
+        message += "*Изменить настройку:*\n"
+        message += "`/set <ключ> <значение>`\n\n"
+        message += "*Примеры:*\n"
+        message += "`/set leverage 5`\n"
+        message += "`/set risk_percent 1.5`\n"
+        message += "`/set enable_notifications true`\n"
+        message += "`/set trading_symbols BTCUSDT,ETHUSDT`"
 
         await self._send_message(update, message, parse_mode='Markdown')
+
+    async def _set_setting(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Изменение настройки"""
+        if not update.effective_user:
+            return
+
+        user_id = update.effective_user.id
+        if not self.db.is_user_allowed(user_id):
+            await self._send_message(update, "❌ Доступ запрещен.")
+            return
+
+        if not context.args or len(context.args) < 2:
+            await self._send_message(update,
+                                     "❌ Использование: /set <ключ> <значение>\n\n"
+                                     "Примеры:\n"
+                                     "`/set trading_symbols BTCUSDT,ETHUSDT,ADAUSDT`\n"
+                                     "`/set leverage 10`\n"
+                                     "`/set risk_percent 2.0`\n"
+                                     "`/set enable_notifications true`\n\n"
+                                     "Посмотреть текущие настройки: /settings"
+                                     )
+            return
+
+        key = context.args[0]
+        value = ' '.join(context.args[1:])
+
+        # Валидация числовых значений
+        numeric_keys = [
+            'leverage', 'min_confidence', 'risk_percent', 'max_position_percent',
+            'max_total_position_percent', 'min_trade_usdt', 'stop_loss_percent',
+            'take_profit_percent', 'trailing_stop_activation_percent',
+            'trailing_stop_distance_percent', 'initial_balance',
+            'deepseek_max_tokens', 'deepseek_temperature', 'trading_interval_minutes'
+        ]
+
+        if key in numeric_keys:
+            try:
+                if key == 'leverage':
+                    leverage = int(value)
+                    if leverage < 1 or leverage > 100:
+                        await self._send_message(update, "❌ Леверидж должен быть от 1 до 100")
+                        return
+                elif key in ['min_confidence', 'deepseek_temperature']:
+                    float_value = float(value)
+                    if float_value < 0 or float_value > 1:
+                        await self._send_message(update, f"❌ {key} должен быть между 0 и 1")
+                        return
+                else:
+                    float_value = float(value)
+                    if float_value < 0:
+                        await self._send_message(update, f"❌ {key} должен быть положительным числом")
+                        return
+            except ValueError:
+                await self._send_message(update, f"❌ {key} должен быть числом")
+                return
+
+        # Валидация булевых значений
+        boolean_keys = [
+            'enable_notifications', 'enable_trade_logging', 'allow_short_positions',
+            'allow_long_positions', 'auto_position_reversal', 'enable_deepseek_reasoning'
+        ]
+        if key in boolean_keys:
+            if value.lower() not in ['true', 'false', '1', '0', 'yes', 'no']:
+                await self._send_message(update, f"❌ {key} должен быть true или false")
+                return
+            # Нормализуем значение
+            value = 'true' if value.lower() in [
+                'true', '1', 'yes'] else 'false'
+
+        # Валидация trading_symbols
+        if key == 'trading_symbols':
+            symbols = [s.strip().upper() for s in value.split(',')]
+            # Простая валидация формата символов
+            for symbol in symbols:
+                if not symbol.endswith('USDT'):
+                    await self._send_message(update, f"❌ Неверный формат символа: {symbol}. Используйте формат: BTCUSDT,ETHUSDT")
+                    return
+            value = ','.join(symbols)
+
+        try:
+            # Обновляем настройку
+            self.trading_bot.update_setting(key, value)
+            await self._send_message(update, f"✅ Настройка `{key}` обновлена на `{value}`")
+
+            # Если изменили торговые символы, показываем обновленный список
+            if key == 'trading_symbols':
+                await self._send_message(update, f"📊 Теперь торгуем: {value}")
+
+        except Exception as e:
+            await self._send_message(update, f"❌ Ошибка при обновлении настройки: {str(e)}")
+
+    async def _reset_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сброс настроек к значениям по умолчанию"""
+        if not update.effective_user:
+            return
+
+        user_id = update.effective_user.id
+        if not self.db.is_user_allowed(user_id) or not self.db.is_user_admin(user_id):
+            await self._send_message(update, "❌ Эта команда доступна только администраторам.")
+            return
+
+        # Подтверждение сброса
+        if context.args and context.args[0] == 'confirm':
+            # Инициализируем настройки по умолчанию
+            self.trading_bot._initialize_default_settings()
+            self.trading_bot._load_settings_from_db()
+
+            await self._send_message(update, "✅ Все настройки сброшены к значениям по умолчанию")
+        else:
+            await self._send_message(
+                update,
+                "⚠️ *ВНИМАНИЕ:* Вы собираетесь сбросить ВСЕ настройки к значениям по умолчанию.\n\n"
+                "Для подтверждения выполните:\n"
+                "`/reset_settings confirm`",
+                parse_mode='Markdown'
+            )
 
     async def _set_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начало процесса смены символа"""

@@ -3,10 +3,13 @@ import signal
 import sys
 import time
 from threading import Thread
+from database import Database
 from trading_strategy import TradingBot
 from telegram_bot import TelegramBot
 from config import Config
 import os
+
+from virtual_trading_bot import VirtualTradingBot
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 class MainApp:
     def __init__(self):
+        self.db = Database()
+
         self.trading_bot = None
         self.telegram_bot = None
         self.is_running = False
@@ -49,8 +54,12 @@ class MainApp:
         self._create_directories()
 
         try:
-            # Инициализация бота
-            self.trading_bot = TradingBot()
+            # Инициализация бота боевого
+            # self.trading_bot = TradingBot()
+            # self.telegram_bot = TelegramBot(self.trading_bot)
+
+            # Инициализация бота тестового
+            self.trading_bot = VirtualTradingBot()
             self.telegram_bot = TelegramBot(self.trading_bot)
 
             # Запуск в отдельном потоке
@@ -91,7 +100,8 @@ class MainApp:
                 logger.error(f"❌ Ошибка в торговом цикле: {e}")
 
             # Пауза между итерациями
-            time.sleep(Config.TRADING_INTERVAL_MINUTES * 60)
+            time.sleep(int(self.db.get_setting(
+                'trading_interval_minutes', '15')) * 60)
 
     def stop(self):
         """Остановка приложения"""

@@ -55,10 +55,51 @@ class BybitClient:
             self.logger.error(f"Ошибка получения данных с Bybit: {e}")
             return {}
 
-    def place_order(self, symbol: str, side: str, qty: float, order_type: str = "Market",
-                    leverage: int = 10, stop_loss: float | None = None, take_profit: float | None = None):
-        """Размещаем ордер на Bybit с маржой"""
+    def get_symbol_info(self, symbol: str) -> Dict | None:
+        """Получение информации о символе, включая минимальные лимиты"""
         try:
+            response = self.session.get_instruments_info(
+                category="linear",
+                symbol=symbol
+            )
+
+            if response and 'result' in response and 'list' in response['result']:
+                symbol_info = response['result']['list'][0]
+                self.logger.info(
+                    f"📊 Информация о символе {symbol}: {symbol_info}")
+                return symbol_info
+            return None
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка получения информации о символе: {e}")
+            return None
+
+    def get_min_order_qty(self, symbol: str) -> float:
+        """Получение минимального количества для ордера"""
+        try:
+            symbol_info = self.get_symbol_info(symbol)
+            if symbol_info and 'lotSizeFilter' in symbol_info:
+                min_qty = float(symbol_info['lotSizeFilter']['minOrderQty'])
+                self.logger.info(
+                    f"📊 Минимальный размер ордера для {symbol}: {min_qty}")
+                return min_qty
+            return 0.01  # Значение по умолчанию
+        except Exception as e:
+            self.logger.error(
+                f"❌ Ошибка получения минимального размера ордера: {e}")
+            return 0.01
+
+    def place_order(self, symbol: str, side: str, qty: float, order_type: str = "Market",
+                    leverage: int = 5, stop_loss: float | None = None, take_profit: float | None = None):
+        """Размещаем ордер на Bybit с проверкой минимальных лимитов"""
+        try:
+            # Проверяем минимальное количество
+            min_qty = self.get_min_order_qty(symbol)
+            if qty < min_qty:
+                self.logger.error(
+                    f"❌ Количество {qty} меньше минимального {min_qty} для {symbol}")
+                return None
+
             # Сначала устанавливаем леверидж
             self.set_leverage(symbol, leverage)
 
@@ -68,16 +109,15 @@ class BybitClient:
                 "symbol": symbol,
                 "side": side,
                 "orderType": order_type,
-                "qty": str(qty),
+                "qty": "{qty:.2f}",
                 "timeInForce": "GTC",
-                "leverage": str(leverage)
             }
 
             # Добавляем стоп-лосс и тейк-профит если указаны
             if stop_loss:
-                order_params["stopLoss"] = str(stop_loss)
+                order_params["stopLoss"] = "{stop_loss:.2f}"
             if take_profit:
-                order_params["takeProfit"] = str(take_profit)
+                order_params["takeProfit"] = "{take_profit:.2f}"
 
             self.logger.info(f"📊 Параметры ордера: {order_params}")
             order = self.session.place_order(**order_params)

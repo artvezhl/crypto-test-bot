@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import json
 import time
 import urllib.parse
 from psycopg2.extras import RealDictCursor
@@ -129,13 +130,19 @@ class Database:
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- Таблица логов торговли
+        -- Таблица логов торговли с расширенными полями
         CREATE TABLE IF NOT EXISTS trade_logs (
             id SERIAL PRIMARY KEY,
             level VARCHAR(20) NOT NULL,
             message TEXT NOT NULL,
             symbol VARCHAR(20),
             position_id INTEGER,
+            signal_data JSONB,
+            confidence DECIMAL(5,4),
+            trade_action VARCHAR(50),
+            response_time DECIMAL(10,4),
+            error_details TEXT,
+            pnl DECIMAL(20, 8),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -145,9 +152,11 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
         CREATE INDEX IF NOT EXISTS idx_balance_history_timestamp ON balance_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trade_logs_created_at ON trade_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_trade_logs_level ON trade_logs(level);
+        CREATE INDEX IF NOT EXISTS idx_trade_logs_trade_action ON trade_logs(trade_action);
 
         -- Начальные настройки
-        INSERT INTO settings (key, value) VALUES
+        INSERT INTO settings (key, value) VALUES 
         ('symbol', 'ETHUSDT'),
         ('leverage', '10')
         ON CONFLICT (key) DO NOTHING;
@@ -339,22 +348,35 @@ class Database:
             self.logger.error(f"❌ Ошибка получения статистики: {e}")
             return {}
 
-    def log_trade_event(self, level: str, message: str, symbol: str | None = None, position_id: int | None = None):
-        """Логирование торговых событий в БД"""
+    def log_trade_event(self, level: str, message: str, symbol: str | None = None,
+                        position_id: int | None = None, signal_data: Dict | None = None,
+                        confidence: float | None = None, trade_action: str | None = None,
+                        response_time: float | None = None, error_details: str | None = None,
+                        pnl: float | None = None):
+        """Логирование торговых событий в БД с расширенной информацией"""
         try:
             if self.db_type == 'postgresql':
                 query = """
-                INSERT INTO trade_logs (level, message, symbol, position_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO trade_logs (level, message, symbol, position_id, signal_data, confidence, trade_action, response_time, error_details, pnl)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
             else:
                 query = """
-                INSERT INTO trade_logs (level, message, symbol, position_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO trade_logs (level, message, symbol, position_id, signal_data, confidence, trade_action, response_time, error_details, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
-            params = (level, message, symbol, position_id)
+            # Подготавливаем данные для вставки
+            import json
+            signal_data_json = json.dumps(signal_data) if signal_data else None
+
+            params = (
+                level, message, symbol, position_id, signal_data_json,
+                confidence, trade_action, response_time, error_details, pnl
+            )
+
             self._execute_query_with_retry(query, params, fetch=False)
+
         except Exception as e:
             self.logger.error(f"❌ Ошибка логирования в БД: {e}")
 
