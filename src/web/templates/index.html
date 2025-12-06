@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Trading Bot - Бэктестинг</title>
+    
+    <!-- Chart.js для графиков -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    
+    <!-- Tailwind CSS для стилей -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Font Awesome для иконок -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .card {
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+        .metric-positive {
+            color: #10b981;
+        }
+        .metric-negative {
+            color: #ef4444;
+        }
+        .loading {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <!-- Header -->
+    <header class="gradient-bg text-white shadow-lg">
+        <div class="container mx-auto px-4 py-6">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <i class="fas fa-chart-line text-3xl"></i>
+                    <h1 class="text-2xl font-bold">Crypto Trading Bot</h1>
+                </div>
+                <div class="text-sm">
+                    <span class="bg-white/20 px-3 py-1 rounded-full">Бэктестинг v0.1.0</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <div class="container mx-auto px-4 py-8">
+        <!-- Панель управления -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <h2 class="text-xl font-bold mb-4 flex items-center">
+                <i class="fas fa-sliders-h mr-2 text-purple-600"></i>
+                Параметры бэктеста
+            </h2>
+            
+            <form id="backtestForm" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">
+                        Символы
+                    </label>
+                    <input type="text" id="symbols" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500" 
+                           placeholder="BTCUSDT,ETHUSDT" value="BTCUSDT,ETHUSDT">
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">
+                        Таймфрейм (минуты)
+                    </label>
+                    <select id="interval" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500">
+                        <option value="1">1 минута</option>
+                        <option value="5">5 минут</option>
+                        <option value="15" selected>15 минут</option>
+                        <option value="30">30 минут</option>
+                        <option value="60">1 час</option>
+                        <option value="240">4 часа</option>
+                        <option value="D">1 день</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">
+                        Период (дней)
+                    </label>
+                    <input type="number" id="days" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500" 
+                           value="7" min="1" max="90">
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">
+                        Начальный баланс ($)
+                    </label>
+                    <input type="number" id="initial_balance" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500" 
+                           value="10000" min="100" step="100">
+                </div>
+                
+                <div class="flex items-center">
+                    <input type="checkbox" id="use_fees" class="mr-2 h-4 w-4 text-purple-600 focus:ring-purple-500 border-gray-300 rounded" checked>
+                    <label for="use_fees" class="text-sm font-medium text-gray-700">
+                        Учитывать комиссии
+                    </label>
+                </div>
+                
+                <div class="flex items-center">
+                    <input type="checkbox" id="use_slippage" class="mr-2 h-4 w-4 text-purple-600 focus:ring-purple-500 border-gray-300 rounded" checked>
+                    <label for="use_slippage" class="text-sm font-medium text-gray-700">
+                        Учитывать slippage
+                    </label>
+                </div>
+                
+                <div class="md:col-span-2 lg:col-span-2">
+                    <button type="submit" id="runButton" class="w-full gradient-bg text-white font-bold py-3 px-6 rounded-md hover:opacity-90 transition duration-200">
+                        <i class="fas fa-play mr-2"></i>
+                        Запустить бэктест
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Индикатор загрузки -->
+        <div id="loading" class="hidden text-center py-12">
+            <div class="loading mx-auto mb-4"></div>
+            <p class="text-gray-600">Выполняется бэктест...</p>
+        </div>
+
+        <!-- Результаты -->
+        <div id="results" class="hidden">
+            <!-- Метрики -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <!-- ROI -->
+                <div class="card bg-white rounded-lg shadow-md p-6">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-gray-600 text-sm font-medium">ROI</span>
+                        <i class="fas fa-chart-line text-purple-600"></i>
+                    </div>
+                    <div id="roi" class="text-3xl font-bold">-</div>
+                    <div class="text-xs text-gray-500 mt-1">Return on Investment</div>
+                </div>
+                
+                <!-- Total PnL -->
+                <div class="card bg-white rounded-lg shadow-md p-6">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-gray-600 text-sm font-medium">Прибыль/Убыток</span>
+                        <i class="fas fa-dollar-sign text-green-600"></i>
+                    </div>
+                    <div id="total_pnl" class="text-3xl font-bold">-</div>
+                    <div class="text-xs text-gray-500 mt-1">Total PnL</div>
+                </div>
+                
+                <!-- Win Rate -->
+                <div class="card bg-white rounded-lg shadow-md p-6">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-gray-600 text-sm font-medium">Win Rate</span>
+                        <i class="fas fa-percentage text-blue-600"></i>
+                    </div>
+                    <div id="win_rate" class="text-3xl font-bold">-</div>
+                    <div class="text-xs text-gray-500 mt-1" id="win_ratio">0/0 сделок</div>
+                </div>
+                
+                <!-- Max Drawdown -->
+                <div class="card bg-white rounded-lg shadow-md p-6">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-gray-600 text-sm font-medium">Max Drawdown</span>
+                        <i class="fas fa-arrow-down text-red-600"></i>
+                    </div>
+                    <div id="max_drawdown" class="text-3xl font-bold">-</div>
+                    <div class="text-xs text-gray-500 mt-1">Максимальная просадка</div>
+                </div>
+            </div>
+
+            <!-- Продвинутые метрики -->
+            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+                <h2 class="text-xl font-bold mb-4 flex items-center">
+                    <i class="fas fa-chart-bar mr-2 text-purple-600"></i>
+                    Продвинутые метрики
+                </h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Sharpe Ratio</div>
+                        <div id="sharpe_ratio" class="text-2xl font-bold">-</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Sortino Ratio</div>
+                        <div id="sortino_ratio" class="text-2xl font-bold">-</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Calmar Ratio</div>
+                        <div id="calmar_ratio" class="text-2xl font-bold">-</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Profit Factor</div>
+                        <div id="profit_factor" class="text-2xl font-bold">-</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Expectancy</div>
+                        <div id="expectancy" class="text-2xl font-bold">-</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-600 text-sm mb-1">Avg Duration</div>
+                        <div id="avg_duration" class="text-2xl font-bold">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Графики -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+                <!-- График баланса -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h3 class="text-lg font-bold mb-4 flex items-center">
+                        <i class="fas fa-chart-area mr-2 text-green-600"></i>
+                        Equity Curve (Баланс)
+                    </h3>
+                    <canvas id="balanceChart"></canvas>
+                </div>
+                
+                <!-- График просадки -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h3 class="text-lg font-bold mb-4 flex items-center">
+                        <i class="fas fa-chart-line mr-2 text-red-600"></i>
+                        Drawdown (Просадка)
+                    </h3>
+                    <canvas id="drawdownChart"></canvas>
+                </div>
+            </div>
+
+            <!-- График распределения PnL -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-bold mb-4 flex items-center">
+                    <i class="fas fa-chart-column mr-2 text-blue-600"></i>
+                    Распределение PnL по сделкам
+                </h3>
+                <canvas id="pnlChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 text-white text-center py-4 mt-12">
+        <p>&copy; 2025 Crypto Trading Bot. Task 4.5 - Web UI</p>
+    </footer>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
+
