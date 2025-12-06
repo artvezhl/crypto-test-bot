@@ -2,9 +2,10 @@ from pybit.unified_trading import HTTP, WebSocket
 from config import Config
 import json
 import logging
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 import threading
 import time
+from datetime import datetime, timedelta
 
 
 class BybitClient:
@@ -315,3 +316,192 @@ class BybitClient:
                 self.logger.info("✅ WebSocket отключен")
             except Exception as e:
                 self.logger.error(f"Ошибка отключения WebSocket: {e}")
+
+    def get_historical_klines(self, symbol: str, interval: str, start_time: int | None = None, 
+                             end_time: int | None = None, limit: int = 200) -> List[Dict]:
+        """
+        Получение исторических свечей с Bybit API.
+        
+        Args:
+            symbol: Торговая пара (например, 'BTCUSDT')
+            interval: Таймфрейм ('1', '5', '15', '30', '60', '240', 'D', 'W')
+            start_time: Начальная временная метка в миллисекундах (опционально)
+            end_time: Конечная временная метка в миллисекундах (опционально)
+            limit: Количество свечей за один запрос (макс 1000)
+            
+        Returns:
+            List[Dict]: Список свечей с данными OHLCV
+        """
+        try:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "limit": min(limit, 1000)  # Bybit лимит - 1000
+            }
+            
+            if start_time:
+                params["start"] = start_time
+            if end_time:
+                params["end"] = end_time
+            
+            self.logger.info(f"📊 Загрузка исторических данных для {symbol}, интервал: {interval}")
+            response = self.session.get_kline(**params)
+            
+            if response and 'result' in response and 'list' in response['result']:
+                klines = response['result']['list']
+                self.logger.info(f"✅ Загружено {len(klines)} свечей для {symbol}")
+                
+                # Преобразуем данные в удобный формат
+                formatted_klines = []
+                for kline in klines:
+                    # Формат Bybit: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+                    formatted_klines.append({
+                        'timestamp': int(kline[0]),
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'close': float(kline[4]),
+                        'volume': float(kline[5]),
+                        'turnover': float(kline[6]) if len(kline) > 6 else 0,
+                        'datetime': datetime.fromtimestamp(int(kline[0]) / 1000).isoformat()
+                    })
+                
+                return formatted_klines
+            else:
+                self.logger.error(f"❌ Неожиданная структура ответа API для {symbol}")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка загрузки исторических данных для {symbol}: {e}")
+            return []
+
+    def get_historical_klines_range(self, symbol: str, interval: str, 
+                                   start_date: datetime, end_date: datetime) -> List[Dict]:
+        """
+        Загружает исторические свечи за указанный период с автоматической пагинацией.
+        
+        Args:
+            symbol: Торговая пара
+            interval: Таймфрейм
+            start_date: Начальная дата
+            end_date: Конечная дата
+            
+        Returns:
+            List[Dict]: Полный список свечей за период
+        """
+        try:
+            # Конвертируем даты в миллисекунды
+            start_ms = int(start_date.timestamp() * 1000)
+            end_ms = int(end_date.timestamp() * 1000)
+            
+            # Определяем интервал в миллисекундах
+            interval_ms = self._interval_to_milliseconds(interval)
+            
+            # Рассчитываем ожидаемое количество свечей
+            expected_candles = int((end_ms - start_ms) / interval_ms)
+            
+            self.logger.info(
+                f"📊 Начинаем загрузку ~{expected_candles} свечей для {symbol} "
+                f"с {start_date.strftime('%Y-%m-%d %H:%M')} по {end_date.strftime('%Y-%m-%d %H:%M')}"
+            )
+            
+            all_klines = []
+            current_start = start_ms
+            batch_count = 0
+            
+            # Загружаем данные порциями по 1000 свечей
+            while current_start < end_ms:
+                batch_count += 1
+                
+                # Загружаем порцию
+                klines = self.get_historical_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    start_time=current_start,
+                    end_time=end_ms,
+                    limit=1000
+                )
+                
+                if not klines:
+                    self.logger.warning(f"⚠️ Нет данных для периода начиная с {current_start}")
+                    break
+                
+                # Добавляем к результату
+                all_klines.extend(klines)
+                
+                # Обновляем начальную точку для следующей порции
+                # Берём timestamp последней свечи + 1 интервал
+                last_timestamp = klines[-1]['timestamp']
+                current_start = last_timestamp + interval_ms
+                
+                self.logger.info(
+                    f"📦 Загружено порция {batch_count}: {len(klines)} свечей "
+                    f"(всего: {len(all_klines)})"
+                )
+                
+                # Задержка между запросами чтобы не превысить rate limit
+                time.sleep(0.1)
+                
+                # Защита от бесконечного цикла
+                if batch_count > 1000:
+                    self.logger.error("❌ Превышен лимит итераций (1000), прерываем загрузку")
+                    break
+            
+            self.logger.info(
+                f"✅ Загрузка завершена: {len(all_klines)} свечей за {batch_count} запросов"
+            )
+            
+            # Сортируем по времени (по возрастанию)
+            all_klines.sort(key=lambda x: x['timestamp'])
+            
+            # Удаляем дубликаты по timestamp
+            unique_klines = []
+            seen_timestamps = set()
+            for kline in all_klines:
+                if kline['timestamp'] not in seen_timestamps:
+                    unique_klines.append(kline)
+                    seen_timestamps.add(kline['timestamp'])
+            
+            if len(unique_klines) < len(all_klines):
+                self.logger.info(
+                    f"🔄 Удалено {len(all_klines) - len(unique_klines)} дубликатов"
+                )
+            
+            return unique_klines
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка загрузки исторических данных за период: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _interval_to_milliseconds(self, interval: str) -> int:
+        """
+        Конвертирует строковый интервал в миллисекунды.
+        
+        Args:
+            interval: '1', '5', '15', '30', '60', '240', 'D', 'W'
+            
+        Returns:
+            int: Количество миллисекунд в интервале
+        """
+        interval_map = {
+            '1': 60 * 1000,           # 1 минута
+            '3': 3 * 60 * 1000,       # 3 минуты
+            '5': 5 * 60 * 1000,       # 5 минут
+            '15': 15 * 60 * 1000,     # 15 минут
+            '30': 30 * 60 * 1000,     # 30 минут
+            '60': 60 * 60 * 1000,     # 1 час
+            '120': 2 * 60 * 60 * 1000,   # 2 часа
+            '240': 4 * 60 * 60 * 1000,   # 4 часа
+            '360': 6 * 60 * 60 * 1000,   # 6 часов
+            'D': 24 * 60 * 60 * 1000,    # 1 день
+            'W': 7 * 24 * 60 * 60 * 1000 # 1 неделя
+        }
+        
+        if interval not in interval_map:
+            self.logger.warning(f"⚠️ Неизвестный интервал {interval}, используем 15 минут")
+            return interval_map['15']
+        
+        return interval_map[interval]

@@ -312,6 +312,9 @@ class Database:
 
             # Создаем таблицу для виртуальных позиций
             self._create_virtual_positions_table()
+            
+            # Создаем таблицу для исторических данных (кеш)
+            self._create_historical_klines_table()
         except Exception as e:
             self.logger.error(f"❌ Ошибка инициализации БД: {e}")
             raise
@@ -1063,3 +1066,309 @@ class Database:
             self.logger.error(
                 f"❌ Ошибка получения статистики виртуальной торговли: {e}")
             return {}
+
+    def _create_historical_klines_table(self):
+        """Создание таблицы для кеширования исторических данных"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                CREATE TABLE IF NOT EXISTS historical_klines (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    interval VARCHAR(10) NOT NULL,
+                    timestamp BIGINT NOT NULL,
+                    open_price DECIMAL(20, 8) NOT NULL,
+                    high_price DECIMAL(20, 8) NOT NULL,
+                    low_price DECIMAL(20, 8) NOT NULL,
+                    close_price DECIMAL(20, 8) NOT NULL,
+                    volume DECIMAL(30, 8) NOT NULL,
+                    turnover DECIMAL(30, 8) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, interval, timestamp)
+                )
+                """
+            else:
+                query = """
+                CREATE TABLE IF NOT EXISTS historical_klines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    open_price REAL NOT NULL,
+                    high_price REAL NOT NULL,
+                    low_price REAL NOT NULL,
+                    close_price REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    turnover REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, interval, timestamp)
+                )
+                """
+            
+            self._execute_query(query, fetch=False)
+            
+            # Создаём индексы для быстрого поиска
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_historical_klines_symbol ON historical_klines(symbol)",
+                "CREATE INDEX IF NOT EXISTS idx_historical_klines_interval ON historical_klines(interval)",
+                "CREATE INDEX IF NOT EXISTS idx_historical_klines_timestamp ON historical_klines(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_historical_klines_symbol_interval_timestamp ON historical_klines(symbol, interval, timestamp)"
+            ]
+            
+            for index_query in indexes:
+                try:
+                    self._execute_query(index_query, fetch=False)
+                except Exception as idx_err:
+                    self.logger.warning(f"⚠️ Индекс уже существует или ошибка: {idx_err}")
+            
+            self.logger.info("✅ Таблица historical_klines и индексы созданы/проверены")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка создания таблицы historical_klines: {e}")
+
+    def save_historical_klines(self, symbol: str, interval: str, klines: List[Dict]) -> int:
+        """
+        Сохраняет исторические свечи в БД (кеш).
+        
+        Args:
+            symbol: Торговая пара
+            interval: Таймфрейм
+            klines: Список свечей
+            
+        Returns:
+            int: Количество сохранённых свечей
+        """
+        try:
+            saved_count = 0
+            
+            for kline in klines:
+                try:
+                    if self.db_type == 'postgresql':
+                        query = """
+                        INSERT INTO historical_klines 
+                        (symbol, interval, timestamp, open_price, high_price, low_price, close_price, volume, turnover)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (symbol, interval, timestamp) DO UPDATE SET
+                            open_price = EXCLUDED.open_price,
+                            high_price = EXCLUDED.high_price,
+                            low_price = EXCLUDED.low_price,
+                            close_price = EXCLUDED.close_price,
+                            volume = EXCLUDED.volume,
+                            turnover = EXCLUDED.turnover
+                        """
+                    else:
+                        query = """
+                        INSERT OR REPLACE INTO historical_klines 
+                        (symbol, interval, timestamp, open_price, high_price, low_price, close_price, volume, turnover)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                    
+                    params = (
+                        symbol,
+                        interval,
+                        kline['timestamp'],
+                        kline['open'],
+                        kline['high'],
+                        kline['low'],
+                        kline['close'],
+                        kline['volume'],
+                        kline.get('turnover', 0)
+                    )
+                    
+                    self._execute_query(query, params, fetch=False)
+                    saved_count += 1
+                    
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Ошибка сохранения свечи {kline.get('timestamp')}: {e}")
+                    continue
+            
+            self.logger.info(f"✅ Сохранено {saved_count}/{len(klines)} свечей для {symbol} ({interval})")
+            return saved_count
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка сохранения исторических данных: {e}")
+            return 0
+
+    def get_historical_klines_from_cache(self, symbol: str, interval: str, 
+                                         start_timestamp: int | None = None,
+                                         end_timestamp: int | None = None,
+                                         limit: int | None = None) -> List[Dict]:
+        """
+        Загружает исторические свечи из кеша БД.
+        
+        Args:
+            symbol: Торговая пара
+            interval: Таймфрейм
+            start_timestamp: Начальная временная метка в миллисекундах
+            end_timestamp: Конечная временная метка в миллисекундах
+            limit: Максимальное количество свечей
+            
+        Returns:
+            List[Dict]: Список свечей
+        """
+        try:
+            query = """
+            SELECT timestamp, open_price, high_price, low_price, close_price, volume, turnover
+            FROM historical_klines
+            WHERE symbol = {} AND interval = {}
+            """.format(
+                '%s' if self.db_type == 'postgresql' else '?',
+                '%s' if self.db_type == 'postgresql' else '?'
+            )
+            
+            params = [symbol, interval]
+            
+            if start_timestamp is not None:
+                query += f" AND timestamp >= {'%s' if self.db_type == 'postgresql' else '?'}"
+                params.append(start_timestamp)
+            
+            if end_timestamp is not None:
+                query += f" AND timestamp <= {'%s' if self.db_type == 'postgresql' else '?'}"
+                params.append(end_timestamp)
+            
+            query += " ORDER BY timestamp ASC"
+            
+            if limit is not None:
+                query += f" LIMIT {'%s' if self.db_type == 'postgresql' else '?'}"
+                params.append(limit)
+            
+            result = self._execute_query(query, tuple(params))
+            
+            if not result:
+                return []
+            
+            # Преобразуем в формат, совместимый с Bybit API
+            klines = []
+            for row in result:
+                klines.append({
+                    'timestamp': int(row['timestamp']),
+                    'open': float(row['open_price']),
+                    'high': float(row['high_price']),
+                    'low': float(row['low_price']),
+                    'close': float(row['close_price']),
+                    'volume': float(row['volume']),
+                    'turnover': float(row.get('turnover', 0)),
+                    'datetime': datetime.fromtimestamp(int(row['timestamp']) / 1000).isoformat()
+                })
+            
+            self.logger.info(f"✅ Загружено {len(klines)} свечей из кеша для {symbol} ({interval})")
+            return klines
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка загрузки данных из кеша: {e}")
+            return []
+
+    def check_cache_coverage(self, symbol: str, interval: str, 
+                            start_timestamp: int, end_timestamp: int) -> Dict:
+        """
+        Проверяет наличие данных в кеше для указанного периода.
+        
+        Returns:
+            Dict: {
+                'has_data': bool,
+                'cached_count': int,
+                'first_timestamp': int,
+                'last_timestamp': int,
+                'missing_ranges': List[tuple]
+            }
+        """
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                SELECT 
+                    COUNT(*) as cached_count,
+                    MIN(timestamp) as first_timestamp,
+                    MAX(timestamp) as last_timestamp
+                FROM historical_klines
+                WHERE symbol = %s AND interval = %s 
+                AND timestamp >= %s AND timestamp <= %s
+                """
+            else:
+                query = """
+                SELECT 
+                    COUNT(*) as cached_count,
+                    MIN(timestamp) as first_timestamp,
+                    MAX(timestamp) as last_timestamp
+                FROM historical_klines
+                WHERE symbol = ? AND interval = ? 
+                AND timestamp >= ? AND timestamp <= ?
+                """
+            
+            params = (symbol, interval, start_timestamp, end_timestamp)
+            result = self._execute_query(query, params)
+            
+            if result and result[0]['cached_count'] > 0:
+                row = result[0]
+                return {
+                    'has_data': True,
+                    'cached_count': int(row['cached_count']),
+                    'first_timestamp': int(row['first_timestamp']),
+                    'last_timestamp': int(row['last_timestamp']),
+                    'coverage_start': start_timestamp,
+                    'coverage_end': end_timestamp
+                }
+            else:
+                return {
+                    'has_data': False,
+                    'cached_count': 0,
+                    'first_timestamp': None,
+                    'last_timestamp': None,
+                    'coverage_start': start_timestamp,
+                    'coverage_end': end_timestamp
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка проверки кеша: {e}")
+            return {
+                'has_data': False,
+                'cached_count': 0,
+                'error': str(e)
+            }
+
+    def clear_historical_cache(self, symbol: str | None = None, 
+                              interval: str | None = None,
+                              older_than_days: int | None = None) -> int:
+        """
+        Очищает кеш исторических данных.
+        
+        Args:
+            symbol: Очистить данные для конкретного символа (если None - все)
+            interval: Очистить данные для конкретного интервала (если None - все)
+            older_than_days: Очистить данные старше N дней
+            
+        Returns:
+            int: Количество удалённых записей
+        """
+        try:
+            query = "DELETE FROM historical_klines WHERE 1=1"
+            params = []
+            
+            if symbol:
+                query += f" AND symbol = {'%s' if self.db_type == 'postgresql' else '?'}"
+                params.append(symbol)
+            
+            if interval:
+                query += f" AND interval = {'%s' if self.db_type == 'postgresql' else '?'}"
+                params.append(interval)
+            
+            if older_than_days:
+                if self.db_type == 'postgresql':
+                    query += " AND created_at < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s"
+                else:
+                    query += " AND created_at < datetime('now', '-' || ? || ' days')"
+                params.append(older_than_days)
+            
+            # Получаем количество записей перед удалением
+            count_query = query.replace("DELETE", "SELECT COUNT(*)")
+            count_result = self._execute_query(count_query, tuple(params) if params else None)
+            deleted_count = count_result[0]['count'] if count_result else 0
+            
+            # Удаляем
+            self._execute_query(query, tuple(params) if params else None, fetch=False)
+            
+            self.logger.info(f"✅ Удалено {deleted_count} записей из кеша")
+            return deleted_count
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка очистки кеша: {e}")
+            return 0
