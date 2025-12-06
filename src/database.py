@@ -1,11 +1,12 @@
 from contextlib import contextmanager
+from decimal import Decimal
 import json
 import time
 import urllib.parse
 from psycopg2.extras import RealDictCursor
 import psycopg2
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import logging
 import os
 
@@ -329,7 +330,7 @@ class Database:
                     COUNT(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND pnl < 0 THEN 1 END) as losing_trades
                 FROM positions
-                WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
                 """
             else:
                 query = """
@@ -342,11 +343,11 @@ class Database:
                     COUNT(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND pnl < 0 THEN 1 END) as losing_trades
                 FROM positions
-                WHERE created_at >= datetime('now', '-%s days')
+                WHERE created_at >= datetime('now', '-' || ? || ' days')
                 """
 
             result = self._execute_query_with_retry(query, (days,))
-            return result[0] if result else {}
+            return self._convert_row(result[0]) if result else {}
         except Exception as e:
             self.logger.error(f"❌ Ошибка получения статистики: {e}")
             return {}
@@ -413,6 +414,46 @@ class Database:
         except Exception as e:
             self.logger.error(f"❌ Ошибка подключения к БД: {e}")
             raise
+
+    @contextmanager
+    def transaction(self):
+        """Context manager для атомарных транзакций.
+        
+        Использование:
+            with self.db.transaction() as conn:
+                # операции с БД
+                # при ошибке - автоматический rollback
+                # при успехе - автоматический commit
+        """
+        conn = self._get_connection()
+        try:
+            yield conn
+            conn.commit()
+            self.logger.debug("✅ Транзакция успешно завершена")
+        except Exception as e:
+            conn.rollback()
+            self.logger.error(f"❌ Транзакция откачена: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def _convert_decimal_to_float(self, value: Any) -> Any:
+        """Конвертирует Decimal в float для удобства работы в Python"""
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
+    def _convert_row(self, row: Dict) -> Dict:
+        """Конвертирует все Decimal значения в словаре в float"""
+        if not row:
+            return row
+        return {key: self._convert_decimal_to_float(value) for key, value in row.items()}
+
+    def _convert_rows(self, rows: List[Dict]) -> List[Dict]:
+        """Конвертирует все Decimal значения в списке словарей в float"""
+        if not rows:
+            return rows
+        return [self._convert_row(row) for row in rows]
 
     def _execute_query(self, query, params=None, fetch=True):
         """Универсальный метод выполнения запросов"""
@@ -490,7 +531,8 @@ class Database:
     def get_open_positions(self) -> List[Dict]:
         """Получение всех открытых позиций"""
         query = "SELECT * FROM positions WHERE status = 'open' ORDER BY created_at DESC"
-        return self._execute_query(query)
+        result = self._execute_query(query)
+        return self._convert_rows(result) if result else []
 
     def update_position_price(self, position_id: int, current_price: float):
         """Обновление текущей цены позиции и расчет PnL"""
@@ -572,7 +614,7 @@ class Database:
             query = "SELECT * FROM positions WHERE id = ?"
 
         result = self._execute_query(query, (position_id,))
-        return result[0] if result else None
+        return self._convert_row(result[0]) if result else None
 
     def update_stop_loss(self, position_id: int, stop_loss: float):
         if self.db_type == 'postgresql':
@@ -768,17 +810,75 @@ class Database:
                 """
 
             self._execute_query(query, fetch=False)
-            self.logger.info("✅ Таблица virtual_positions создана/проверена")
+            
+            # Создаём индексы для оптимизации запросов
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_virtual_positions_status ON virtual_positions(status)",
+                "CREATE INDEX IF NOT EXISTS idx_virtual_positions_symbol ON virtual_positions(symbol)",
+                "CREATE INDEX IF NOT EXISTS idx_virtual_positions_created_at ON virtual_positions(created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_virtual_positions_symbol_status ON virtual_positions(symbol, status)"
+            ]
+            
+            for index_query in indexes:
+                try:
+                    self._execute_query(index_query, fetch=False)
+                except Exception as idx_err:
+                    self.logger.warning(f"⚠️ Индекс уже существует или ошибка: {idx_err}")
+            
+            self.logger.info("✅ Таблица virtual_positions и индексы созданы/проверены")
 
         except Exception as e:
             self.logger.error(
                 f"❌ Ошибка создания таблицы virtual_positions: {e}")
 
+    def _validate_position_params(self, symbol: str, side: str, size: float, 
+                                   entry_price: float, leverage: int = 1,
+                                   stop_loss: float | None = None, 
+                                   take_profit: float | None = None) -> None:
+        """Валидация параметров позиции.
+        
+        Raises:
+            ValueError: если параметры невалидны
+        """
+        # Валидация side
+        if side not in ['BUY', 'SELL']:
+            raise ValueError(f"Невалидный side: {side}. Должен быть 'BUY' или 'SELL'")
+        
+        # Валидация size
+        if size <= 0:
+            raise ValueError(f"Невалидный size: {size}. Должен быть > 0")
+        
+        # Валидация entry_price
+        if entry_price <= 0:
+            raise ValueError(f"Невалидный entry_price: {entry_price}. Должен быть > 0")
+        
+        # Валидация leverage
+        if leverage < 1 or leverage > 125:
+            raise ValueError(f"Невалидный leverage: {leverage}. Должен быть от 1 до 125")
+        
+        # Валидация symbol
+        if not symbol or len(symbol) < 3:
+            raise ValueError(f"Невалидный symbol: {symbol}. Минимум 3 символа")
+        
+        # Валидация stop-loss и take-profit относительно entry_price и side
+        if side == 'BUY':
+            if stop_loss is not None and stop_loss >= entry_price:
+                raise ValueError(f"Stop-loss ({stop_loss}) должен быть ниже entry_price ({entry_price}) для BUY")
+            if take_profit is not None and take_profit <= entry_price:
+                raise ValueError(f"Take-profit ({take_profit}) должен быть выше entry_price ({entry_price}) для BUY")
+        else:  # SELL
+            if stop_loss is not None and stop_loss <= entry_price:
+                raise ValueError(f"Stop-loss ({stop_loss}) должен быть выше entry_price ({entry_price}) для SELL")
+            if take_profit is not None and take_profit >= entry_price:
+                raise ValueError(f"Take-profit ({take_profit}) должен быть ниже entry_price ({entry_price}) для SELL")
+
     def add_virtual_position(self, symbol: str, side: str, size: float, entry_price: float,
                              leverage: int = 1, stop_loss: float | None = None,
                              take_profit: float | None = None) -> int:
-        """Добавление новой виртуальной позиции"""
+        """Добавление новой виртуальной позиции с валидацией параметров"""
         try:
+            # Валидация входных данных
+            self._validate_position_params(symbol, side, size, entry_price, leverage, stop_loss, take_profit)
             if self.db_type == 'postgresql':
                 query = """
                 INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit)
@@ -822,7 +922,7 @@ class Database:
                 query = "SELECT * FROM virtual_positions WHERE status = 'open' ORDER BY created_at DESC"
                 result = self._execute_query(query)
 
-            return result if result else []
+            return self._convert_rows(result) if result else []
         except Exception as e:
             self.logger.error(f"❌ Ошибка получения виртуальных позиций: {e}")
             return []
@@ -836,7 +936,7 @@ class Database:
                 query = "SELECT * FROM virtual_positions WHERE id = ?"
 
             result = self._execute_query(query, (position_id,))
-            return result[0] if result else None
+            return self._convert_row(result[0]) if result else None
         except Exception as e:
             self.logger.error(f"❌ Ошибка получения виртуальной позиции: {e}")
             return None
@@ -940,7 +1040,7 @@ class Database:
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
                 FROM virtual_positions 
-                WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
                 """
             else:
                 query = """
@@ -954,11 +1054,11 @@ class Database:
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
                 FROM virtual_positions 
-                WHERE created_at >= datetime('now', '-%s days')
+                WHERE created_at >= datetime('now', '-' || ? || ' days')
                 """
 
             result = self._execute_query(query, (days,))
-            return result[0] if result else {}
+            return self._convert_row(result[0]) if result else {}
         except Exception as e:
             self.logger.error(
                 f"❌ Ошибка получения статистики виртуальной торговли: {e}")
