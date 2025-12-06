@@ -2,6 +2,7 @@ import pytz
 from deepseek_client import DeepSeekClient
 from bybit_client import BybitClient
 from database import Database
+from utils.performance import log_performance
 import time
 import logging
 from datetime import datetime
@@ -264,6 +265,7 @@ class VirtualTradingBot:
 
         return stop_loss, take_profit
 
+    @log_performance(threshold_seconds=30.0)
     def run_iteration(self):
         """Одна итерация виртуального торгового цикла"""
         try:
@@ -283,6 +285,7 @@ class VirtualTradingBot:
         except Exception as e:
             self.logger.error(f"❌ Ошибка в виртуальной торговой итерации: {e}")
 
+    @log_performance(threshold_seconds=10.0)
     def _process_symbol(self, symbol: str):
         """Обработка одного символа для виртуальной торговли"""
         # Получаем реальные рыночные данные
@@ -358,6 +361,7 @@ class VirtualTradingBot:
                 )
                 self._close_virtual_position(position, current_price, close_reason)
 
+    @log_performance(threshold_seconds=30.0)
     def get_trading_signal_with_logging(self, symbol: str, market_data: Dict) -> Dict:
         """Получение сигнала от DeepSeek с логированием"""
         signal = self.deepseek.get_trading_signal(market_data)
@@ -591,6 +595,7 @@ class VirtualTradingBot:
             self.logger.error(
                 f"❌ Ошибка загрузки виртуальных позиций из БД: {e}")
 
+    @log_performance(threshold_seconds=5.0)
     def _update_virtual_balance(self):
         """Обновляет виртуальный баланс на основе открытых виртуальных позиций из БД"""
         try:
