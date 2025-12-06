@@ -36,12 +36,8 @@ class VirtualTradingBot:
             self.highest_balance = self.initial_balance
             self.lowest_balance = self.initial_balance
 
-            # Виртуальные позиции
-            self.virtual_positions = []
-
-            # Статистика виртуальной торговли
-            self.virtual_trades_count = 0
-            self.total_virtual_pnl = 0.0
+            # Статистика виртуальной торговли загружается из БД по запросу
+            # (self.virtual_positions, virtual_trades_count, total_virtual_pnl удалены - данные берутся из БД)
 
             self.logger.info(
                 f"🔧 Инициализирован ВИРТУАЛЬНЫЙ торговый бот для {len(self.symbols)} символов")
@@ -309,54 +305,58 @@ class VirtualTradingBot:
         if position_amount <= 0:
             return
 
-        # Исполняем виртуальную сделку если сигнал хороший
-        if signal['confidence'] > 0.5:
+        # Исполняем виртуальную сделку если сигнал хороший (используем настройку из БД)
+        if signal['confidence'] > self.min_confidence:
             self._execute_virtual_trading_decision(
                 symbol, signal, market_data, position_amount)
 
     def _update_virtual_positions_prices(self, symbol: str, current_price: float):
-        """Обновление цен виртуальных позиций для конкретного символа"""
-        for position in self.virtual_positions:
-            if position['symbol'] == symbol and position['status'] == 'open':
-                position['current_price'] = current_price
-
-                # Расчет нереализованного PnL
-                if position['side'] == 'BUY':
-                    position['unrealized_pnl'] = (
-                        current_price - position['entry_price']) * position['size']
-                else:  # SELL
-                    position['unrealized_pnl'] = (
-                        position['entry_price'] - current_price) * position['size']
+        """Обновление цен виртуальных позиций для конкретного символа из БД"""
+        open_positions = self.db.get_virtual_open_positions(symbol)
+        
+        for position in open_positions:
+            # Обновляем цену в БД (метод также рассчитывает PnL)
+            self.db.update_virtual_position_price(position['id'], current_price)
+            
+            self.logger.debug(
+                f"Updated position #{position['id']}: {symbol} @ ${current_price:.2f}"
+            )
 
     def _check_virtual_position_conditions(self, symbol: str, current_price: float):
-        """Проверка условий для закрытия виртуальных позиций"""
-        for position in self.virtual_positions:
-            if position['symbol'] == symbol and position['status'] == 'open':
-                stop_loss = position.get('stop_loss')
-                take_profit = position.get('take_profit')
+        """Проверка условий для закрытия виртуальных позиций из БД"""
+        open_positions = self.db.get_virtual_open_positions(symbol)
+        
+        for position in open_positions:
+            stop_loss = position.get('stop_loss')
+            take_profit = position.get('take_profit')
 
-                if stop_loss and take_profit:
-                    should_close = False
-                    close_reason = ""
+            if not (stop_loss and take_profit):
+                continue
+                
+            should_close = False
+            close_reason = ""
 
-                    if position['side'] == 'BUY':
-                        if current_price <= stop_loss:
-                            should_close = True
-                            close_reason = "stop_loss"
-                        elif current_price >= take_profit:
-                            should_close = True
-                            close_reason = "take_profit"
-                    else:  # SELL
-                        if current_price >= stop_loss:
-                            should_close = True
-                            close_reason = "stop_loss"
-                        elif current_price <= take_profit:
-                            should_close = True
-                            close_reason = "take_profit"
+            if position['side'] == 'BUY':
+                if current_price <= stop_loss:
+                    should_close = True
+                    close_reason = "stop_loss"
+                elif current_price >= take_profit:
+                    should_close = True
+                    close_reason = "take_profit"
+            else:  # SELL
+                if current_price >= stop_loss:
+                    should_close = True
+                    close_reason = "stop_loss"
+                elif current_price <= take_profit:
+                    should_close = True
+                    close_reason = "take_profit"
 
-                    if should_close:
-                        self._close_virtual_position(
-                            position, current_price, close_reason)
+            if should_close:
+                self.logger.info(
+                    f"🎯 Условие {close_reason} сработало для позиции #{position['id']} "
+                    f"({symbol} @ ${current_price:.2f})"
+                )
+                self._close_virtual_position(position, current_price, close_reason)
 
     def get_trading_signal_with_logging(self, symbol: str, market_data: Dict) -> Dict:
         """Получение сигнала от DeepSeek с логированием"""
@@ -378,8 +378,8 @@ class VirtualTradingBot:
     def _execute_virtual_trading_decision(self, symbol: str, signal: Dict, market_data: Dict, position_amount: float):
         """Исполняет виртуальное торговое решение"""
         try:
-            current_positions = [
-                p for p in self.virtual_positions if p['symbol'] == symbol and p['status'] == 'open']
+            # Получаем позиции из БД вместо памяти
+            current_positions = self.db.get_virtual_open_positions(symbol)
             has_position = len(current_positions) > 0
 
             signal_action = signal['action']
@@ -478,35 +478,40 @@ class VirtualTradingBot:
             return
 
         try:
+            # Получаем актуальную статистику из БД
+            stats = self.db.get_virtual_trade_stats(365)
+            total_pnl = stats.get('total_realized_pnl', 0) or 0
+            total_trades = stats.get('total_trades', 0) or 0
+            
             # Рассчитываем PnL
             pnl = position.get('realized_pnl', 0)
             pnl_percent = (
-                pnl / (position['entry_price'] * position['size'])) * 100
+                pnl / (position['entry_price'] * position['size'])) * 100 if position['entry_price'] * position['size'] > 0 else 0
 
             moscow_time = self._get_moscow_time()
             pnl_emoji = "📈" if pnl >= 0 else "📉"
 
             message = f"""
-            🔒 *ВИРТУАЛЬНАЯ ПОЗИЦИЯ ЗАКРЫТА*
+🔒 *ВИРТУАЛЬНАЯ ПОЗИЦИЯ ЗАКРЫТА*
 
-            🆔 *ID:* #{position['id']} (ВИРТУАЛЬНАЯ)
-            💹 *Символ:* {position['symbol']}
-            📊 *Сторона:* {position['side']}
-            💵 *Цена входа:* ${position['entry_price']:.2f}
-            💰 *Цена выхода:* ${close_price:.2f}
-            {pnl_emoji} *P&L:* {pnl:.2f} USDT ({pnl_percent:.2f}%)
-            🔢 *Размер:* {position['size']:.4f}
-            ⚡ *Леверидж:* {position['leverage']}x
-            📝 *Причина:* {position.get('close_reason', 'N/A')}
+🆔 *ID:* #{position['id']} (ВИРТУАЛЬНАЯ)
+💹 *Символ:* {position['symbol']}
+📊 *Сторона:* {position['side']}
+💵 *Цена входа:* ${position['entry_price']:.2f}
+💰 *Цена выхода:* ${close_price:.2f}
+{pnl_emoji} *P&L:* {pnl:.2f} USDT ({pnl_percent:.2f}%)
+🔢 *Размер:* {position['size']:.4f}
+⚡ *Леверидж:* {position['leverage']}x
+📝 *Причина:* {position.get('close_reason', 'N/A')}
 
-            💰 *Общий виртуальный PnL:* {self.total_virtual_pnl:.2f} USDT
-            🔢 *Всего виртуальных сделок:* {self.virtual_trades_count}
+💰 *Общий виртуальный PnL:* {total_pnl:.2f} USDT
+🔢 *Всего виртуальных сделок:* {total_trades}
 
-            ⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
-            📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
+⏰ *Время (МСК):* {moscow_time.strftime("%H:%M:%S")}
+📅 *Дата:* {moscow_time.strftime("%d.%m.%Y")}
 
-            *⚠️ ВНИМАНИЕ: Это виртуальная позиция!*
-            """
+*⚠️ ВНИМАНИЕ: Это виртуальная позиция!*
+"""
 
             # Отправляем сообщение всем пользователям
             self._broadcast_message(message)
@@ -652,8 +657,6 @@ class VirtualTradingBot:
         )
 
         if position_id:
-            self.virtual_trades_count += 1
-
             # Отправляем уведомление
             self._send_virtual_trade_notification(
                 "🟢 ВИРТУАЛЬНАЯ ПОКУПКА", position_id, signal, entry_price)
@@ -695,8 +698,6 @@ class VirtualTradingBot:
         )
 
         if position_id:
-            self.virtual_trades_count += 1
-
             # Отправляем уведомление
             self._send_virtual_trade_notification(
                 "🔴 ВИРТУАЛЬНАЯ ПРОДАЖА", position_id, signal, entry_price)
@@ -720,10 +721,6 @@ class VirtualTradingBot:
         try:
             # Закрываем позицию в БД
             self.db.close_virtual_position(position['id'], exit_price, reason)
-
-            # Обновляем общий виртуальный PnL
-            stats = self.db.get_virtual_trade_stats(365)
-            self.total_virtual_pnl = stats.get('total_realized_pnl', 0) or 0
 
             self.logger.info(
                 f"✅ Виртуальная позиция #{position['id']} закрыта. Причина: {reason}")
