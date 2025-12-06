@@ -829,10 +829,37 @@ class Database:
                     self.logger.warning(f"⚠️ Индекс уже существует или ошибка: {idx_err}")
             
             self.logger.info("✅ Таблица virtual_positions и индексы созданы/проверены")
+            
+            # Миграция: добавляем поля для комиссий если их нет
+            self._migrate_add_fee_columns()
 
         except Exception as e:
             self.logger.error(
                 f"❌ Ошибка создания таблицы virtual_positions: {e}")
+
+    def _migrate_add_fee_columns(self):
+        """Миграция: добавление полей для комиссий в таблицу virtual_positions"""
+        try:
+            columns_to_add = [
+                ('entry_fee', 'DECIMAL(20, 8) DEFAULT 0' if self.db_type == 'postgresql' else 'REAL DEFAULT 0'),
+                ('exit_fee', 'DECIMAL(20, 8) DEFAULT 0' if self.db_type == 'postgresql' else 'REAL DEFAULT 0'),
+                ('total_fees', 'DECIMAL(20, 8) DEFAULT 0' if self.db_type == 'postgresql' else 'REAL DEFAULT 0')
+            ]
+            
+            for column_name, column_type in columns_to_add:
+                try:
+                    query = f"ALTER TABLE virtual_positions ADD COLUMN {column_name} {column_type}"
+                    self._execute_query(query, fetch=False)
+                    self.logger.info(f"✅ Добавлена колонка {column_name} в virtual_positions")
+                except Exception as e:
+                    # Колонка уже существует - это нормально
+                    if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                        pass
+                    else:
+                        self.logger.debug(f"Колонка {column_name} уже существует или ошибка: {e}")
+        
+        except Exception as e:
+            self.logger.warning(f"⚠️ Ошибка миграции колонок комиссий: {e}")
 
     def _validate_position_params(self, symbol: str, side: str, size: float, 
                                    entry_price: float, leverage: int = 1,
@@ -877,25 +904,25 @@ class Database:
 
     def add_virtual_position(self, symbol: str, side: str, size: float, entry_price: float,
                              leverage: int = 1, stop_loss: float | None = None,
-                             take_profit: float | None = None) -> int:
+                             take_profit: float | None = None, entry_fee: float = 0.0) -> int:
         """Добавление новой виртуальной позиции с валидацией параметров"""
         try:
             # Валидация входных данных
             self._validate_position_params(symbol, side, size, entry_price, leverage, stop_loss, take_profit)
             if self.db_type == 'postgresql':
                 query = """
-                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """
             else:
                 query = """
-                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             params = (symbol, side, size, entry_price, entry_price,
-                      leverage, stop_loss, take_profit)
+                      leverage, stop_loss, take_profit, entry_fee, entry_fee)
             result = self._execute_query(query, params, fetch=True)
 
             position_id = result['id'] if result else None
@@ -986,8 +1013,8 @@ class Database:
         except Exception as e:
             self.logger.error(f"❌ Ошибка обновления виртуальной позиции: {e}")
 
-    def close_virtual_position(self, position_id: int, exit_price: float, close_reason: str = "manual"):
-        """Закрытие виртуальной позиции"""
+    def close_virtual_position(self, position_id: int, exit_price: float, close_reason: str = "manual", exit_fee: float = 0.0):
+        """Закрытие виртуальной позиции с учетом комиссий"""
         try:
             position = self.get_virtual_position(position_id)
             if not position:
@@ -996,19 +1023,26 @@ class Database:
             side = position['side']
             size = position['size']
             entry_price = position['entry_price']
+            entry_fee = position.get('entry_fee', 0.0) or 0.0
 
-            # Расчет финального PnL
+            # Расчет финального PnL (без комиссий)
             if side == 'BUY':
-                pnl = (exit_price - entry_price) * size
-                pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+                pnl_gross = (exit_price - entry_price) * size
+                pnl_percent_gross = ((exit_price - entry_price) / entry_price) * 100
             else:  # SELL
-                pnl = (entry_price - exit_price) * size
-                pnl_percent = ((entry_price - exit_price) / entry_price) * 100
+                pnl_gross = (entry_price - exit_price) * size
+                pnl_percent_gross = ((entry_price - exit_price) / entry_price) * 100
+
+            # Вычитаем все комиссии из PnL
+            total_fees = entry_fee + exit_fee
+            pnl_net = pnl_gross - total_fees
+            pnl_percent = (pnl_net / (entry_price * size)) * 100 if (entry_price * size) > 0 else 0
 
             if self.db_type == 'postgresql':
                 query = """
                 UPDATE virtual_positions 
                 SET status = 'closed', exit_price = %s, realized_pnl = %s, pnl_percent = %s, 
+                    exit_fee = %s, total_fees = %s,
                     close_reason = %s, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """
@@ -1016,20 +1050,21 @@ class Database:
                 query = """
                 UPDATE virtual_positions 
                 SET status = 'closed', exit_price = ?, realized_pnl = ?, pnl_percent = ?, 
+                    exit_fee = ?, total_fees = ?,
                     close_reason = ?, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """
 
-            params = (exit_price, pnl, pnl_percent, close_reason, position_id)
+            params = (exit_price, pnl_net, pnl_percent, exit_fee, total_fees, close_reason, position_id)
             self._execute_query(query, params, fetch=False)
             self.logger.info(
-                f"✅ Виртуальная позиция #{position_id} закрыта. PnL: {pnl:.2f} USDT")
+                f"✅ Виртуальная позиция #{position_id} закрыта. PnL: {pnl_net:.2f} USDT (комиссии: {total_fees:.4f} USDT)")
 
         except Exception as e:
             self.logger.error(f"❌ Ошибка закрытия виртуальной позиции: {e}")
 
     def get_virtual_trade_stats(self, days: int = 30) -> Dict:
-        """Получение статистики виртуальной торговли"""
+        """Получение статистики виртуальной торговли с учетом комиссий"""
         try:
             if self.db_type == 'postgresql':
                 query = """
@@ -1039,9 +1074,14 @@ class Database:
                     COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
                     COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
                     COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    COALESCE(SUM(total_fees), 0) as total_fees_paid,
+                    COALESCE(SUM(entry_fee), 0) as total_entry_fees,
+                    COALESCE(SUM(exit_fee), 0) as total_exit_fees,
                     AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
-                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN realized_pnl END), 0) as total_profit,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN ABS(realized_pnl) END), 0) as total_loss
                 FROM virtual_positions 
                 WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
                 """
@@ -1053,9 +1093,14 @@ class Database:
                     COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
                     COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
                     COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    COALESCE(SUM(total_fees), 0) as total_fees_paid,
+                    COALESCE(SUM(entry_fee), 0) as total_entry_fees,
+                    COALESCE(SUM(exit_fee), 0) as total_exit_fees,
                     AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
                     COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
-                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN realized_pnl END), 0) as total_profit,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN ABS(realized_pnl) END), 0) as total_loss
                 FROM virtual_positions 
                 WHERE created_at >= datetime('now', '-' || ? || ' days')
                 """

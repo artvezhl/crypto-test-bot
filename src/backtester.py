@@ -338,10 +338,15 @@ class BacktestEngine(VirtualTradingBot):
             stats = self.get_virtual_stats()
             
             # Базовые метрики
-            total_pnl = stats.get('total_realized_pnl', 0)
-            total_trades = stats.get('total_trades', 0)
-            winning_trades = stats.get('winning_trades', 0)
-            losing_trades = stats.get('losing_trades', 0)
+            total_pnl = stats.get('total_realized_pnl', 0) or 0
+            total_trades = stats.get('total_trades', 0) or 0
+            winning_trades = stats.get('winning_trades', 0) or 0
+            losing_trades = stats.get('losing_trades', 0) or 0
+            
+            # Метрики комиссий
+            total_fees = stats.get('total_fees_paid', 0) or 0
+            total_entry_fees = stats.get('total_entry_fees', 0) or 0
+            total_exit_fees = stats.get('total_exit_fees', 0) or 0
             
             # Рассчитываем производные метрики
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
@@ -360,7 +365,11 @@ class BacktestEngine(VirtualTradingBot):
                 'lowest_balance': self.lowest_balance,
                 'max_drawdown': self._calculate_max_drawdown(),
                 'sharpe_ratio': self._calculate_sharpe_ratio(),
-                'profit_factor': self._calculate_profit_factor()
+                'profit_factor': self._calculate_profit_factor(),
+                # Метрики комиссий
+                'total_fees_paid': total_fees,
+                'total_entry_fees': total_entry_fees,
+                'total_exit_fees': total_exit_fees
             }
             
             return results
@@ -412,18 +421,15 @@ class BacktestEngine(VirtualTradingBot):
         try:
             stats = self.get_virtual_stats()
             
-            # Получаем детальную статистику сделок
-            # TODO: Добавить методы в Database для получения суммы прибылей и убытков
+            # Получаем сумму прибылей и убытков
+            total_profit = stats.get('total_profit', 0) or 0
+            total_loss = stats.get('total_loss', 0) or 0
             
-            # Временная заглушка
-            winning_trades = stats.get('winning_trades', 0)
-            losing_trades = stats.get('losing_trades', 0)
+            if total_loss == 0:
+                return 999.0 if total_profit > 0 else 0.0
             
-            if losing_trades == 0:
-                return 999.0 if winning_trades > 0 else 0.0
-            
-            # Упрощенный расчет (нужна сумма прибылей и убытков отдельно)
-            return winning_trades / losing_trades if losing_trades > 0 else 0.0
+            # Profit Factor = Общая прибыль / Общие убытки
+            return total_profit / total_loss if total_loss > 0 else 0.0
             
         except Exception as e:
             self.logger.error(f"❌ Ошибка расчета Profit Factor: {e}")
@@ -463,6 +469,16 @@ class BacktestEngine(VirtualTradingBot):
             self.logger.info(f"   Прибыльных: {results.get('winning_trades', 0)}")
             self.logger.info(f"   Убыточных: {results.get('losing_trades', 0)}")
             self.logger.info(f"   Win Rate: {results.get('win_rate', 0):.2f}%")
+            
+            # Показываем информацию о комиссиях если они есть
+            total_fees = results.get('total_fees_paid', 0) or 0
+            if total_fees > 0:
+                self.logger.info(f"\n💸 Комиссии:")
+                self.logger.info(f"   Всего комиссий: ${total_fees:.4f}")
+                self.logger.info(f"   Комиссии входа: ${results.get('total_entry_fees', 0):.4f}")
+                self.logger.info(f"   Комиссии выхода: ${results.get('total_exit_fees', 0):.4f}")
+                fee_impact = (total_fees / results.get('initial_balance', 1)) * 100
+                self.logger.info(f"   Влияние на баланс: {fee_impact:.3f}%")
             
             self.logger.info(f"\n📉 Риски:")
             self.logger.info(f"   Максимальный баланс: ${results.get('highest_balance', 0):.2f}")

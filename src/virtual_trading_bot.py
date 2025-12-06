@@ -86,7 +86,14 @@ class VirtualTradingBot:
             'deepseek_temperature': '1',
 
             # Интервал торговли
-            'trading_interval_minutes': '15'
+            'trading_interval_minutes': '15',
+
+            # Комиссии и slippage (для реалистичного бэктестинга)
+            'maker_fee_percent': '0.055',    # Bybit maker fee
+            'taker_fee_percent': '0.06',     # Bybit taker fee
+            'slippage_percent': '0.05',      # Проскальзывание цены
+            'use_fees_in_backtest': 'true',  # Учитывать комиссии в бэктестах
+            'use_slippage_in_backtest': 'true'  # Учитывать slippage в бэктестах
         }
 
         for key, value in default_settings.items():
@@ -138,6 +145,18 @@ class VirtualTradingBot:
             'enable_notifications', 'true').lower() == 'true'
         self.enable_trade_logging = self.db.get_setting(
             'enable_trade_logging', 'true').lower() == 'true'
+
+        # Комиссии и slippage (для бэктестинга)
+        self.maker_fee_percent = float(
+            self.db.get_setting('maker_fee_percent', '0.055'))
+        self.taker_fee_percent = float(
+            self.db.get_setting('taker_fee_percent', '0.06'))
+        self.slippage_percent = float(
+            self.db.get_setting('slippage_percent', '0.05'))
+        self.use_fees_in_backtest = self.db.get_setting(
+            'use_fees_in_backtest', 'true').lower() == 'true'
+        self.use_slippage_in_backtest = self.db.get_setting(
+            'use_slippage_in_backtest', 'true').lower() == 'true'
 
         self.logger.info(
             "✅ Настройки виртуального бота загружены из базы данных")
@@ -264,6 +283,44 @@ class VirtualTradingBot:
             take_profit = entry_price * (1 - self.take_profit_percent / 100)
 
         return stop_loss, take_profit
+
+    def apply_slippage(self, price: float, side: str) -> float:
+        """
+        Применяет slippage к цене.
+        
+        Args:
+            price: Базовая цена
+            side: Направление сделки ('BUY' или 'SELL')
+            
+        Returns:
+            float: Цена с учетом slippage
+        """
+        if not hasattr(self, 'use_slippage_in_backtest') or not self.use_slippage_in_backtest:
+            return price
+        
+        # Для покупки slippage увеличивает цену (покупаем дороже)
+        # Для продажи slippage уменьшает цену (продаем дешевле)
+        if side == 'BUY':
+            return price * (1 + self.slippage_percent / 100)
+        else:  # SELL
+            return price * (1 - self.slippage_percent / 100)
+
+    def calculate_trading_fee(self, position_value: float, is_maker: bool = False) -> float:
+        """
+        Рассчитывает комиссию за сделку.
+        
+        Args:
+            position_value: Размер позиции в USDT
+            is_maker: True если maker ордер, False если taker
+            
+        Returns:
+            float: Сумма комиссии в USDT
+        """
+        if not hasattr(self, 'use_fees_in_backtest') or not self.use_fees_in_backtest:
+            return 0.0
+        
+        fee_percent = self.maker_fee_percent if is_maker else self.taker_fee_percent
+        return position_value * (fee_percent / 100)
 
     @log_performance(threshold_seconds=30.0)
     def run_iteration(self):
@@ -643,14 +700,29 @@ class VirtualTradingBot:
         """Исполняет виртуальную покупку с записью в БД"""
         self.logger.info(f"🎯 Исполняем ВИРТУАЛЬНЫЙ BUY сигнал для {symbol}")
 
-        entry_price = market_data['price']
+        # Применяем slippage к цене входа
+        base_price = market_data['price']
+        entry_price = self.apply_slippage(base_price, 'BUY')
+        
+        # Рассчитываем количество контрактов
+        quantity = position_amount / entry_price
+        
+        # Рассчитываем комиссию (используем taker fee для рыночных ордеров)
+        position_value = entry_price * quantity
+        entry_fee = self.calculate_trading_fee(position_value, is_maker=False)
+
+        # Логируем slippage и комиссии если они применяются
+        if entry_price != base_price:
+            slippage_diff = ((entry_price - base_price) / base_price) * 100
+            self.logger.info(f"   💫 Slippage: {slippage_diff:+.3f}% (цена: ${base_price:.2f} → ${entry_price:.2f})")
+        if entry_fee > 0:
+            fee_percent = (entry_fee / position_value) * 100
+            self.logger.info(f"   💸 Комиссия входа: ${entry_fee:.4f} ({fee_percent:.3f}%)")
+
         stop_loss, take_profit = self.calculate_stop_loss_take_profit(
             entry_price, "BUY")
 
-        # Рассчитываем количество контрактов
-        quantity = position_amount / entry_price
-
-        # Создаем виртуальную позицию в БД
+        # Создаем виртуальную позицию в БД с учетом комиссии
         position_id = self.db.add_virtual_position(
             symbol=symbol,
             side='BUY',
@@ -658,7 +730,8 @@ class VirtualTradingBot:
             entry_price=entry_price,
             leverage=self.leverage,
             stop_loss=stop_loss,
-            take_profit=take_profit
+            take_profit=take_profit,
+            entry_fee=entry_fee
         )
 
         if position_id:
@@ -684,14 +757,29 @@ class VirtualTradingBot:
         """Исполняет виртуальную продажу с записью в БД"""
         self.logger.info(f"🎯 Исполняем ВИРТУАЛЬНЫЙ SELL сигнал для {symbol}")
 
-        entry_price = market_data['price']
+        # Применяем slippage к цене входа
+        base_price = market_data['price']
+        entry_price = self.apply_slippage(base_price, 'SELL')
+        
+        # Рассчитываем количество контрактов
+        quantity = position_amount / entry_price
+        
+        # Рассчитываем комиссию (используем taker fee для рыночных ордеров)
+        position_value = entry_price * quantity
+        entry_fee = self.calculate_trading_fee(position_value, is_maker=False)
+
+        # Логируем slippage и комиссии если они применяются
+        if entry_price != base_price:
+            slippage_diff = ((entry_price - base_price) / base_price) * 100
+            self.logger.info(f"   💫 Slippage: {slippage_diff:+.3f}% (цена: ${base_price:.2f} → ${entry_price:.2f})")
+        if entry_fee > 0:
+            fee_percent = (entry_fee / position_value) * 100
+            self.logger.info(f"   💸 Комиссия входа: ${entry_fee:.4f} ({fee_percent:.3f}%)")
+
         stop_loss, take_profit = self.calculate_stop_loss_take_profit(
             entry_price, "SELL")
 
-        # Рассчитываем количество контрактов
-        quantity = position_amount / entry_price
-
-        # Создаем виртуальную позицию в БД
+        # Создаем виртуальную позицию в БД с учетом комиссии
         position_id = self.db.add_virtual_position(
             symbol=symbol,
             side='SELL',
@@ -699,7 +787,8 @@ class VirtualTradingBot:
             entry_price=entry_price,
             leverage=self.leverage,
             stop_loss=stop_loss,
-            take_profit=take_profit
+            take_profit=take_profit,
+            entry_fee=entry_fee
         )
 
         if position_id:
@@ -721,11 +810,28 @@ class VirtualTradingBot:
             self.logger.error(
                 f"❌ Не удалось создать виртуальную позицию для {symbol}")
 
-    def _close_virtual_position(self, position: Dict, exit_price: float, reason: str):
+    def _close_virtual_position(self, position: Dict, base_exit_price: float, reason: str):
         """Закрытие виртуальной позиции с записью в БД"""
         try:
-            # Закрываем позицию в БД
-            self.db.close_virtual_position(position['id'], exit_price, reason)
+            # Применяем slippage к цене выхода (инвертируем направление относительно открытия)
+            # При закрытии BUY мы продаем (SELL), при закрытии SELL мы покупаем (BUY)
+            close_side = 'SELL' if position['side'] == 'BUY' else 'BUY'
+            exit_price = self.apply_slippage(base_exit_price, close_side)
+            
+            # Рассчитываем комиссию выхода
+            position_value = exit_price * position['size']
+            exit_fee = self.calculate_trading_fee(position_value, is_maker=False)
+            
+            # Логируем slippage и комиссии если они применяются
+            if exit_price != base_exit_price:
+                slippage_diff = ((exit_price - base_exit_price) / base_exit_price) * 100
+                self.logger.info(f"   💫 Slippage при выходе: {slippage_diff:+.3f}% (цена: ${base_exit_price:.2f} → ${exit_price:.2f})")
+            if exit_fee > 0:
+                fee_percent = (exit_fee / position_value) * 100
+                self.logger.info(f"   💸 Комиссия выхода: ${exit_fee:.4f} ({fee_percent:.3f}%)")
+            
+            # Закрываем позицию в БД с учетом комиссий
+            self.db.close_virtual_position(position['id'], exit_price, reason, exit_fee)
 
             self.logger.info(
                 f"✅ Виртуальная позиция #{position['id']} закрыта. Причина: {reason}")
