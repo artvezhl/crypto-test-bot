@@ -217,24 +217,9 @@ jobs:
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # Trading Settings
-          TRADING_INTERVAL_MINUTES=${{ vars.TRADING_INTERVAL_MINUTES }}
-          DEFAULT_SYMBOL=${{ vars.DEFAULT_SYMBOL }}
-          POSITION_SIZE=${{ vars.POSITION_SIZE }}
-          MIN_CONFIDENCE=${{ vars.MIN_CONFIDENCE }}
-
-          # Risk Management
-          RISK_PERCENT=${{ vars.RISK_PERCENT }}
-          MAX_POSITION_PERCENT=${{ vars.MAX_POSITION_PERCENT }}
-          MIN_TRADE_USDT=${{ vars.MIN_TRADE_USDT }}
-          STOP_LOSS_PERCENT=${{ vars.STOP_LOSS_PERCENT }}
-          TAKE_PROFIT_PERCENT=${{ vars.TAKE_PROFIT_PERCENT }}
-
           # Database
           DATABASE_URL=postgresql://trader:password@postgres:5432/trading_bot
-
-          # Initial Balance
-          INITIAL_BALANCE=${{ vars.INITIAL_BALANCE }}
+          
           EOF
           echo "✅ Production .env file created"
 

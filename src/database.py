@@ -308,6 +308,9 @@ class Database:
             else:
                 self._init_sqlite()
             self.logger.info("✅ База данных инициализирована")
+
+            # Создаем таблицу для виртуальных позиций
+            self._create_virtual_positions_table()
         except Exception as e:
             self.logger.error(f"❌ Ошибка инициализации БД: {e}")
             raise
@@ -713,3 +716,250 @@ class Database:
         except Exception as e:
             self.logger.error(f"Ошибка удаления пользователя: {e}")
             return False
+
+    def _create_virtual_positions_table(self):
+        """Создание таблицы для виртуальных позиций"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                CREATE TABLE IF NOT EXISTS virtual_positions (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    side VARCHAR(10) NOT NULL,
+                    size DECIMAL(20, 8) NOT NULL,
+                    entry_price DECIMAL(20, 8) NOT NULL,
+                    current_price DECIMAL(20, 8) NOT NULL,
+                    exit_price DECIMAL(20, 8),
+                    stop_loss DECIMAL(20, 8),
+                    take_profit DECIMAL(20, 8),
+                    leverage INTEGER DEFAULT 1,
+                    status VARCHAR(20) DEFAULT 'open',
+                    unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
+                    realized_pnl DECIMAL(20, 8) DEFAULT 0,
+                    pnl_percent DECIMAL(10, 4) DEFAULT 0,
+                    close_reason VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP
+                )
+                """
+            else:
+                query = """
+                CREATE TABLE IF NOT EXISTS virtual_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    size REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    current_price REAL NOT NULL,
+                    exit_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    leverage INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'open',
+                    unrealized_pnl REAL DEFAULT 0,
+                    realized_pnl REAL DEFAULT 0,
+                    pnl_percent REAL DEFAULT 0,
+                    close_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP
+                )
+                """
+
+            self._execute_query(query, fetch=False)
+            self.logger.info("✅ Таблица virtual_positions создана/проверена")
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Ошибка создания таблицы virtual_positions: {e}")
+
+    def add_virtual_position(self, symbol: str, side: str, size: float, entry_price: float,
+                             leverage: int = 1, stop_loss: float | None = None,
+                             take_profit: float | None = None) -> int:
+        """Добавление новой виртуальной позиции"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """
+            else:
+                query = """
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """
+
+            params = (symbol, side, size, entry_price, entry_price,
+                      leverage, stop_loss, take_profit)
+            result = self._execute_query(query, params, fetch=True)
+
+            position_id = result['id'] if result else None
+            if not position_id and self.db_type == 'sqlite':
+                # Для SQLite получаем lastrowid
+                position_id = self._execute_query(
+                    "SELECT last_insert_rowid() as id")[0]['id']
+
+            self.logger.info(
+                f"✅ Виртуальная позиция #{position_id} добавлена: {side} {size} {symbol}")
+            return position_id if position_id else 0
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка добавления виртуальной позиции: {e}")
+            return 0
+
+    def get_virtual_open_positions(self, symbol: str | None = None) -> List[Dict]:
+        """Получение всех открытых виртуальных позиций"""
+        try:
+            if symbol:
+                if self.db_type == 'postgresql':
+                    query = "SELECT * FROM virtual_positions WHERE status = 'open' AND symbol = %s ORDER BY created_at DESC"
+                else:
+                    query = "SELECT * FROM virtual_positions WHERE status = 'open' AND symbol = ? ORDER BY created_at DESC"
+                result = self._execute_query(query, (symbol,))
+            else:
+                query = "SELECT * FROM virtual_positions WHERE status = 'open' ORDER BY created_at DESC"
+                result = self._execute_query(query)
+
+            return result if result else []
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка получения виртуальных позиций: {e}")
+            return []
+
+    def get_virtual_position(self, position_id: int) -> Optional[Dict]:
+        """Получение виртуальной позиции по ID"""
+        try:
+            if self.db_type == 'postgresql':
+                query = "SELECT * FROM virtual_positions WHERE id = %s"
+            else:
+                query = "SELECT * FROM virtual_positions WHERE id = ?"
+
+            result = self._execute_query(query, (position_id,))
+            return result[0] if result else None
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка получения виртуальной позиции: {e}")
+            return None
+
+    def update_virtual_position_price(self, position_id: int, current_price: float):
+        """Обновление текущей цены виртуальной позиции и расчет PnL"""
+        try:
+            # Сначала получаем данные позиции
+            position = self.get_virtual_position(position_id)
+            if not position:
+                return
+
+            side = position['side']
+            size = position['size']
+            entry_price = position['entry_price']
+
+            # Расчет PnL
+            if side == 'BUY':
+                pnl = (current_price - entry_price) * size
+                pnl_percent = ((current_price - entry_price) /
+                               entry_price) * 100
+            else:  # SELL
+                pnl = (entry_price - current_price) * size
+                pnl_percent = ((entry_price - current_price) /
+                               entry_price) * 100
+
+            # Обновляем позицию
+            if self.db_type == 'postgresql':
+                query = """
+                UPDATE virtual_positions 
+                SET current_price = %s, unrealized_pnl = %s, pnl_percent = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """
+            else:
+                query = """
+                UPDATE virtual_positions 
+                SET current_price = ?, unrealized_pnl = ?, pnl_percent = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """
+
+            params = (current_price, pnl, pnl_percent, position_id)
+            self._execute_query(query, params, fetch=False)
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обновления виртуальной позиции: {e}")
+
+    def close_virtual_position(self, position_id: int, exit_price: float, close_reason: str = "manual"):
+        """Закрытие виртуальной позиции"""
+        try:
+            position = self.get_virtual_position(position_id)
+            if not position:
+                return
+
+            side = position['side']
+            size = position['size']
+            entry_price = position['entry_price']
+
+            # Расчет финального PnL
+            if side == 'BUY':
+                pnl = (exit_price - entry_price) * size
+                pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+            else:  # SELL
+                pnl = (entry_price - exit_price) * size
+                pnl_percent = ((entry_price - exit_price) / entry_price) * 100
+
+            if self.db_type == 'postgresql':
+                query = """
+                UPDATE virtual_positions 
+                SET status = 'closed', exit_price = %s, realized_pnl = %s, pnl_percent = %s, 
+                    close_reason = %s, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """
+            else:
+                query = """
+                UPDATE virtual_positions 
+                SET status = 'closed', exit_price = ?, realized_pnl = ?, pnl_percent = ?, 
+                    close_reason = ?, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """
+
+            params = (exit_price, pnl, pnl_percent, close_reason, position_id)
+            self._execute_query(query, params, fetch=False)
+            self.logger.info(
+                f"✅ Виртуальная позиция #{position_id} закрыта. PnL: {pnl:.2f} USDT")
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка закрытия виртуальной позиции: {e}")
+
+    def get_virtual_trade_stats(self, days: int = 30) -> Dict:
+        """Получение статистики виртуальной торговли"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                SELECT 
+                    COUNT(*) as total_trades,
+                    COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
+                    COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
+                    COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+                    COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
+                FROM virtual_positions 
+                WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                """
+            else:
+                query = """
+                SELECT 
+                    COUNT(*) as total_trades,
+                    COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
+                    COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
+                    COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+                    COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades
+                FROM virtual_positions 
+                WHERE created_at >= datetime('now', '-%s days')
+                """
+
+            result = self._execute_query(query, (days,))
+            return result[0] if result else {}
+        except Exception as e:
+            self.logger.error(
+                f"❌ Ошибка получения статистики виртуальной торговли: {e}")
+            return {}
