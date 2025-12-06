@@ -65,6 +65,12 @@ class BacktestEngine(VirtualTradingBot):
         self.total_candles = 0
         self.processed_candles = 0
         
+        # История баланса для расчета метрик (timestamp: balance)
+        self.balance_history: List[Dict] = []
+        
+        # История сделок для детального анализа
+        self.trades_history: List[Dict] = []
+        
         self.logger.info("✅ BacktestEngine инициализирован")
     
     def run_backtest(self, symbols: List[str], interval: str,
@@ -206,6 +212,13 @@ class BacktestEngine(VirtualTradingBot):
                     if candle:
                         # Обрабатываем свечу (аналогично _process_symbol в VirtualTradingBot)
                         self._process_historical_candle(symbol, candle)
+                
+                # Записываем баланс в историю для расчета метрик
+                self.balance_history.append({
+                    'timestamp': timestamp,
+                    'datetime': self.current_backtest_time,
+                    'balance': self.current_balance
+                })
                 
                 # Прогресс-бар
                 if (i + 1) % report_interval == 0 or i == total_steps - 1:
@@ -353,6 +366,7 @@ class BacktestEngine(VirtualTradingBot):
             roi = (total_pnl / self.initial_balance * 100) if self.initial_balance > 0 else 0
             
             results = {
+                # Базовые метрики
                 'initial_balance': self.initial_balance,
                 'final_balance': self.current_balance,
                 'total_pnl': total_pnl,
@@ -363,9 +377,18 @@ class BacktestEngine(VirtualTradingBot):
                 'win_rate': win_rate,
                 'highest_balance': self.highest_balance,
                 'lowest_balance': self.lowest_balance,
+                
+                # Риск-метрики
                 'max_drawdown': self._calculate_max_drawdown(),
                 'sharpe_ratio': self._calculate_sharpe_ratio(),
+                'sortino_ratio': self._calculate_sortino_ratio(),
+                'calmar_ratio': self._calculate_calmar_ratio(),
+                
+                # Торговые метрики
                 'profit_factor': self._calculate_profit_factor(),
+                'expectancy': self._calculate_expectancy(),
+                'avg_trade_duration_hours': self._calculate_avg_trade_duration(),
+                
                 # Метрики комиссий
                 'total_fees_paid': total_fees,
                 'total_entry_fees': total_entry_fees,
@@ -377,6 +400,61 @@ class BacktestEngine(VirtualTradingBot):
         except Exception as e:
             self.logger.error(f"❌ Ошибка расчета результатов: {e}")
             return {}
+    
+    def _grade_sharpe_ratio(self, sharpe: float) -> str:
+        """
+        Оценивает качество Sharpe Ratio.
+        
+        Args:
+            sharpe: Значение Sharpe Ratio
+            
+        Returns:
+            str: Оценка с эмодзи
+        """
+        if sharpe >= 3.0:
+            return "🌟 Отлично"
+        elif sharpe >= 2.0:
+            return "✅ Очень хорошо"
+        elif sharpe >= 1.0:
+            return "👍 Хорошо"
+        elif sharpe >= 0.5:
+            return "🟡 Приемлемо"
+        elif sharpe >= 0:
+            return "🟠 Слабо"
+        else:
+            return "🔴 Плохо"
+    
+    def _estimate_periods_per_year(self) -> int:
+        """
+        Оценивает количество периодов в год на основе истории баланса.
+        
+        Returns:
+            int: Количество периодов в год
+        """
+        try:
+            if len(self.balance_history) < 2:
+                return 0
+            
+            # Вычисляем среднюю длительность периода
+            first_time = self.balance_history[0]['datetime']
+            last_time = self.balance_history[-1]['datetime']
+            total_duration = (last_time - first_time).total_seconds()
+            
+            if total_duration <= 0:
+                return 0
+            
+            num_periods = len(self.balance_history) - 1
+            avg_period_seconds = total_duration / num_periods
+            
+            # Секунд в году
+            seconds_per_year = 365.25 * 24 * 60 * 60
+            
+            periods_per_year = int(seconds_per_year / avg_period_seconds)
+            return periods_per_year
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка оценки периодов в год: {e}")
+            return 0
     
     def _calculate_max_drawdown(self) -> float:
         """
@@ -395,20 +473,169 @@ class BacktestEngine(VirtualTradingBot):
             self.logger.error(f"❌ Ошибка расчета Max Drawdown: {e}")
             return 0.0
     
-    def _calculate_sharpe_ratio(self) -> float:
+    def _calculate_sharpe_ratio(self, risk_free_rate: float = 0.0) -> float:
         """
-        Рассчитывает коэффициент Шарпа.
+        Рассчитывает коэффициент Шарпа (риск-скорректированная доходность).
         
+        Sharpe Ratio = (Mean Return - Risk Free Rate) / Std Dev of Returns
+        
+        Args:
+            risk_free_rate: Безрисковая ставка в процентах годовых (по умолчанию 0%)
+            
         Returns:
-            float: Sharpe Ratio
+            float: Sharpe Ratio (чем выше, тем лучше)
         """
         try:
-            # TODO: Реализовать полный расчет Sharpe Ratio
-            # Требуется история баланса по времени
-            self.logger.debug("⚠️ Sharpe Ratio - базовая реализация")
-            return 0.0
+            if len(self.balance_history) < 2:
+                self.logger.debug("⚠️ Недостаточно данных для расчета Sharpe Ratio")
+                return 0.0
+            
+            # Рассчитываем доходность между периодами (returns)
+            returns = []
+            for i in range(1, len(self.balance_history)):
+                prev_balance = self.balance_history[i-1]['balance']
+                curr_balance = self.balance_history[i]['balance']
+                
+                if prev_balance > 0:
+                    period_return = (curr_balance - prev_balance) / prev_balance
+                    returns.append(period_return)
+            
+            if len(returns) == 0:
+                return 0.0
+            
+            # Вычисляем среднюю доходность и стандартное отклонение
+            import numpy as np
+            mean_return = np.mean(returns)
+            std_return = np.std(returns, ddof=1)  # ddof=1 для выборочного стд. откл.
+            
+            if std_return == 0:
+                return 0.0
+            
+            # Преобразуем risk-free rate в периодическую ставку
+            # (предполагаем, что periods примерно соответствуют годовой доходности)
+            periods_per_year = self._estimate_periods_per_year()
+            risk_free_per_period = (risk_free_rate / 100) / periods_per_year if periods_per_year > 0 else 0
+            
+            # Sharpe Ratio
+            sharpe = (mean_return - risk_free_per_period) / std_return
+            
+            # Аннуализируем (умножаем на sqrt(periods_per_year))
+            if periods_per_year > 0:
+                sharpe = sharpe * np.sqrt(periods_per_year)
+            
+            return float(sharpe)
+            
         except Exception as e:
             self.logger.error(f"❌ Ошибка расчета Sharpe Ratio: {e}")
+            return 0.0
+    
+    def _calculate_sortino_ratio(self, target_return: float = 0.0) -> float:
+        """
+        Рассчитывает коэффициент Сортино (учитывает только негативную волатильность).
+        
+        Sortino Ratio = (Mean Return - Target Return) / Downside Deviation
+        
+        Args:
+            target_return: Целевая доходность (обычно 0% или минимальная приемлемая)
+            
+        Returns:
+            float: Sortino Ratio (чем выше, тем лучше)
+        """
+        try:
+            if len(self.balance_history) < 2:
+                self.logger.debug("⚠️ Недостаточно данных для расчета Sortino Ratio")
+                return 0.0
+            
+            # Рассчитываем доходность между периодами
+            returns = []
+            for i in range(1, len(self.balance_history)):
+                prev_balance = self.balance_history[i-1]['balance']
+                curr_balance = self.balance_history[i]['balance']
+                
+                if prev_balance > 0:
+                    period_return = (curr_balance - prev_balance) / prev_balance
+                    returns.append(period_return)
+            
+            if len(returns) == 0:
+                return 0.0
+            
+            import numpy as np
+            mean_return = np.mean(returns)
+            
+            # Рассчитываем downside deviation (учитываем только отрицательные отклонения)
+            downside_returns = [r - target_return for r in returns if r < target_return]
+            
+            if len(downside_returns) == 0:
+                # Нет негативных периодов - отличный результат
+                return 999.0 if mean_return > target_return else 0.0
+            
+            downside_deviation = np.sqrt(np.mean(np.array(downside_returns) ** 2))
+            
+            if downside_deviation == 0:
+                return 0.0
+            
+            # Sortino Ratio
+            sortino = (mean_return - target_return) / downside_deviation
+            
+            # Аннуализируем
+            periods_per_year = self._estimate_periods_per_year()
+            if periods_per_year > 0:
+                sortino = sortino * np.sqrt(periods_per_year)
+            
+            return float(sortino)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка расчета Sortino Ratio: {e}")
+            return 0.0
+    
+    def _calculate_calmar_ratio(self) -> float:
+        """
+        Рассчитывает коэффициент Кальмара (доходность к максимальной просадке).
+        
+        Calmar Ratio = Annualized Return / Maximum Drawdown
+        
+        Returns:
+            float: Calmar Ratio (чем выше, тем лучше)
+        """
+        try:
+            max_dd = self._calculate_max_drawdown()
+            
+            if max_dd == 0:
+                return 0.0
+            
+            # Рассчитываем аннуализированную доходность
+            if len(self.balance_history) < 2:
+                return 0.0
+            
+            first_balance = self.balance_history[0]['balance']
+            last_balance = self.balance_history[-1]['balance']
+            
+            if first_balance <= 0:
+                return 0.0
+            
+            total_return = (last_balance - first_balance) / first_balance
+            
+            # Аннуализируем доходность
+            first_time = self.balance_history[0]['datetime']
+            last_time = self.balance_history[-1]['datetime']
+            days = (last_time - first_time).days
+            
+            if days <= 0:
+                return 0.0
+            
+            years = days / 365.25
+            if years <= 0:
+                return 0.0
+            
+            annualized_return = ((1 + total_return) ** (1 / years) - 1) * 100
+            
+            # Calmar Ratio = Annualized Return / Max Drawdown
+            calmar = annualized_return / max_dd if max_dd > 0 else 0.0
+            
+            return float(calmar)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка расчета Calmar Ratio: {e}")
             return 0.0
     
     def _calculate_profit_factor(self) -> float:
@@ -433,6 +660,95 @@ class BacktestEngine(VirtualTradingBot):
             
         except Exception as e:
             self.logger.error(f"❌ Ошибка расчета Profit Factor: {e}")
+            return 0.0
+    
+    def _calculate_avg_trade_duration(self) -> float:
+        """
+        Рассчитывает среднюю продолжительность сделки.
+        
+        Returns:
+            float: Средняя продолжительность в часах
+        """
+        try:
+            # Получаем все закрытые позиции из БД
+            if self.db.db_type == 'postgresql':
+                query = """
+                SELECT created_at, closed_at 
+                FROM virtual_positions 
+                WHERE status = 'closed' AND closed_at IS NOT NULL
+                """
+            else:
+                query = """
+                SELECT created_at, closed_at 
+                FROM virtual_positions 
+                WHERE status = 'closed' AND closed_at IS NOT NULL
+                """
+            
+            positions = self.db._execute_query(query)
+            
+            if not positions or len(positions) == 0:
+                return 0.0
+            
+            durations = []
+            for pos in positions:
+                created = pos.get('created_at')
+                closed = pos.get('closed_at')
+                
+                if created and closed:
+                    # Если это строки, парсим их
+                    if isinstance(created, str):
+                        from datetime import datetime
+                        created = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    if isinstance(closed, str):
+                        from datetime import datetime
+                        closed = datetime.fromisoformat(closed.replace('Z', '+00:00'))
+                    
+                    duration = (closed - created).total_seconds() / 3600  # в часах
+                    durations.append(duration)
+            
+            if len(durations) == 0:
+                return 0.0
+            
+            import numpy as np
+            return float(np.mean(durations))
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка расчета средней продолжительности сделки: {e}")
+            return 0.0
+    
+    def _calculate_expectancy(self) -> float:
+        """
+        Рассчитывает математическое ожидание (expectancy) стратегии.
+        
+        Expectancy = (Win Rate * Avg Win) - (Loss Rate * Avg Loss)
+        
+        Returns:
+            float: Ожидаемая прибыль на сделку в USDT
+        """
+        try:
+            stats = self.get_virtual_stats()
+            
+            total_trades = stats.get('total_trades', 0) or 0
+            winning_trades = stats.get('winning_trades', 0) or 0
+            losing_trades = stats.get('losing_trades', 0) or 0
+            total_profit = stats.get('total_profit', 0) or 0
+            total_loss = stats.get('total_loss', 0) or 0
+            
+            if total_trades == 0:
+                return 0.0
+            
+            win_rate = winning_trades / total_trades
+            loss_rate = losing_trades / total_trades
+            
+            avg_win = total_profit / winning_trades if winning_trades > 0 else 0
+            avg_loss = total_loss / losing_trades if losing_trades > 0 else 0
+            
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+            
+            return float(expectancy)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка расчета expectancy: {e}")
             return 0.0
     
     def _save_results(self, results: Dict):
@@ -485,9 +801,28 @@ class BacktestEngine(VirtualTradingBot):
             self.logger.info(f"   Минимальный баланс: ${results.get('lowest_balance', 0):.2f}")
             self.logger.info(f"   Max Drawdown: {results.get('max_drawdown', 0):.2f}%")
             
-            self.logger.info(f"\n📊 Метрики:")
-            self.logger.info(f"   Sharpe Ratio: {results.get('sharpe_ratio', 0):.2f}")
+            self.logger.info(f"\n📊 Риск-скорректированные метрики:")
+            sharpe = results.get('sharpe_ratio', 0)
+            sortino = results.get('sortino_ratio', 0)
+            calmar = results.get('calmar_ratio', 0)
+            
+            sharpe_grade = self._grade_sharpe_ratio(sharpe)
+            self.logger.info(f"   Sharpe Ratio: {sharpe:.3f} {sharpe_grade}")
+            self.logger.info(f"   Sortino Ratio: {sortino:.3f}")
+            self.logger.info(f"   Calmar Ratio: {calmar:.3f}")
+            
+            self.logger.info(f"\n💹 Торговые метрики:")
             self.logger.info(f"   Profit Factor: {results.get('profit_factor', 0):.2f}")
+            self.logger.info(f"   Expectancy: ${results.get('expectancy', 0):.2f} на сделку")
+            
+            avg_duration = results.get('avg_trade_duration_hours', 0)
+            if avg_duration > 0:
+                if avg_duration < 1:
+                    self.logger.info(f"   Средняя длительность сделки: {avg_duration * 60:.1f} минут")
+                elif avg_duration < 24:
+                    self.logger.info(f"   Средняя длительность сделки: {avg_duration:.1f} часов")
+                else:
+                    self.logger.info(f"   Средняя длительность сделки: {avg_duration / 24:.1f} дней")
             
         except Exception as e:
             self.logger.error(f"❌ Ошибка вывода отчета: {e}")
