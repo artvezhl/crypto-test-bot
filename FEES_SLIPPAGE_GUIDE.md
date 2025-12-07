@@ -366,3 +366,4 @@ LIMIT 5;
 **Task:** 4.3 - Realistic Trading Simulation  
 **Версия:** 0.1.0
 
+

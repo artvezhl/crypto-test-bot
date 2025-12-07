@@ -71,11 +71,20 @@ class BacktestEngine(VirtualTradingBot):
         # История сделок для детального анализа
         self.trades_history: List[Dict] = []
         
-        self.logger.info("✅ BacktestEngine инициализирован")
+        # Callback для отчета о прогрессе
+        self.progress_callback: Optional[callable] = None
+        
+        # Стратегия для бэктестинга (simple или deepseek)
+        # simple - быстрая техническая стратегия без API вызовов
+        # deepseek - использует AI (медленно, ~30-60 мин для 2000 свечей)
+        self.backtest_strategy = self.config.get('strategy', 'simple')
+        
+        self.logger.info(f"✅ BacktestEngine инициализирован (стратегия: {self.backtest_strategy})")
     
     def run_backtest(self, symbols: List[str], interval: str,
                      start_date: datetime, end_date: datetime,
-                     initial_balance: Optional[float] = None) -> Dict:
+                     initial_balance: Optional[float] = None,
+                     progress_callback: Optional[callable] = None) -> Dict:
         """
         Запускает бэктест на исторических данных.
         
@@ -85,10 +94,12 @@ class BacktestEngine(VirtualTradingBot):
             start_date: Начальная дата
             end_date: Конечная дата
             initial_balance: Начальный баланс (если None - берется из настроек)
+            progress_callback: Функция обратного вызова для отчета о прогрессе
             
         Returns:
             Dict: Результаты бэктеста с метриками
         """
+        self.progress_callback = progress_callback
         try:
             self.logger.info("=" * 80)
             self.logger.info("🚀 ЗАПУСК БЭКТЕСТА")
@@ -106,9 +117,15 @@ class BacktestEngine(VirtualTradingBot):
             
             # Шаг 1: Загрузка исторических данных
             self.logger.info("\n📦 ШАГ 1: Загрузка исторических данных...")
+            if self.progress_callback:
+                self.progress_callback(0, f"Загрузка данных для {len(symbols)} символов...")
+            
             if not self._load_historical_data(symbols, interval, start_date, end_date):
                 self.logger.error("❌ Не удалось загрузить данные для бэктеста")
                 return {}
+            
+            if self.progress_callback:
+                self.progress_callback(10, f"Загрузка завершена. Обработано {self.total_candles} свечей")
             
             # Шаг 2: Создание записи бэктеста в БД
             self.logger.info("\n💾 ШАГ 2: Инициализация бэктеста в БД...")
@@ -118,10 +135,14 @@ class BacktestEngine(VirtualTradingBot):
             
             # Шаг 3: Прогон стратегии на исторических данных
             self.logger.info("\n🎯 ШАГ 3: Симуляция торговли...")
+            if self.progress_callback:
+                self.progress_callback(10, "Начало симуляции торговли...")
             self._simulate_trading(start_date, end_date, interval)
             
             # Шаг 4: Расчет результатов
             self.logger.info("\n📊 ШАГ 4: Расчет метрик...")
+            if self.progress_callback:
+                self.progress_callback(90, "Расчет метрик...")
             results = self._calculate_results()
             
             # Шаг 5: Сохранение результатов
@@ -151,12 +172,34 @@ class BacktestEngine(VirtualTradingBot):
             bool: True если данные успешно загружены
         """
         try:
-            self.historical_data = self.data_loader.preload_data_for_backtest(
-                symbols=symbols,
-                interval=interval,
-                start_date=start_date,
-                end_date=end_date
-            )
+            # Загружаем данные для каждого символа с обновлением прогресса
+            self.historical_data = {}
+            total_symbols = len(symbols)
+            
+            for i, symbol in enumerate(symbols, 1):
+                # Обновляем прогресс загрузки (0-10% диапазон)
+                progress = (i / total_symbols) * 10
+                if self.progress_callback:
+                    self.progress_callback(
+                        progress, 
+                        f"Загрузка данных {i}/{total_symbols}: {symbol}..."
+                    )
+                
+                self.logger.info(f"📊 [{i}/{total_symbols}] Загрузка {symbol}...")
+                
+                klines = self.data_loader.load_historical_data(
+                    symbol=symbol,
+                    interval=interval,
+                    start_date=start_date,
+                    end_date=end_date,
+                    use_cache=True
+                )
+                
+                if klines:
+                    self.historical_data[symbol] = klines
+                    self.logger.info(f"✅ {symbol}: {len(klines)} свечей")
+                else:
+                    self.logger.warning(f"⚠️ {symbol}: нет данных")
             
             if not self.historical_data:
                 self.logger.error("❌ Не удалось загрузить исторические данные")
@@ -197,7 +240,7 @@ class BacktestEngine(VirtualTradingBot):
             
             # Прогресс
             total_steps = len(timeline)
-            report_interval = max(1, total_steps // 20)  # Отчет каждые 5%
+            report_interval = max(1, total_steps // 100)  # Отчет каждые 1%
             
             start_time = time.time()
             
@@ -225,6 +268,15 @@ class BacktestEngine(VirtualTradingBot):
                     progress = ((i + 1) / total_steps) * 100
                     elapsed = time.time() - start_time
                     eta = (elapsed / (i + 1)) * (total_steps - i - 1)
+                    
+                    # Отправляем прогресс через callback
+                    if self.progress_callback:
+                        # Прогресс симуляции занимает 10-90% общего прогресса
+                        overall_progress = 10 + (progress * 0.8)
+                        self.progress_callback(
+                            overall_progress,
+                            f"Симуляция: {progress:.1f}% | Баланс: ${self.current_balance:.2f}"
+                        )
                     
                     self.logger.info(
                         f"📈 Прогресс: {progress:.1f}% ({i + 1}/{total_steps}) | "
@@ -295,23 +347,35 @@ class BacktestEngine(VirtualTradingBot):
             # Проверяем условия для закрытия позиций
             self._check_virtual_position_conditions(symbol, current_price)
             
-            # Создаем market_data в формате, совместимом с VirtualTradingBot
-            market_data = {
-                'symbol': symbol,
-                'price': current_price,
-                'price_change_24h': 0,  # Можно рассчитать если нужно
-                'volume_24h': candle['volume'],
-                'historical_prices': []  # Можно добавить предыдущие свечи
-            }
-            
-            # Получаем сигнал от DeepSeek (или используем другую стратегию)
-            signal = self.get_trading_signal_with_logging(symbol, market_data)
+            # Выбираем стратегию на основе конфигурации
+            if self.backtest_strategy == 'deepseek':
+                # Используем DeepSeek API (медленно!)
+                market_data = {
+                    'symbol': symbol,
+                    'price': current_price,
+                    'price_change_24h': 0,
+                    'volume_24h': candle['volume'],
+                    'historical_prices': []
+                }
+                signal = self.get_trading_signal_with_logging(symbol, market_data)
+            else:
+                # Используем простую техническую стратегию (быстро!)
+                signal = self._get_simple_backtest_signal(symbol, candle)
             
             # Рассчитываем размер позиции
             position_amount = self.calculate_position_size(symbol, current_price)
             
             if position_amount <= 0:
                 return
+            
+            # Создаем market_data для совместимости
+            market_data = {
+                'symbol': symbol,
+                'price': current_price,
+                'price_change_24h': 0,
+                'volume_24h': candle['volume'],
+                'historical_prices': []
+            }
             
             # Исполняем торговое решение если сигнал достаточно уверенный
             if signal['confidence'] > self.min_confidence:
@@ -321,6 +385,76 @@ class BacktestEngine(VirtualTradingBot):
             
         except Exception as e:
             self.logger.error(f"❌ Ошибка обработки свечи {symbol}: {e}")
+    
+    def _get_simple_backtest_signal(self, symbol: str, candle: Dict) -> Dict:
+        """
+        Простая техническая стратегия для бэктестинга (без DeepSeek API).
+        
+        Использует базовый momentum и volume анализ для быстрой симуляции.
+        
+        Args:
+            symbol: Торговая пара
+            candle: Текущая свеча OHLCV
+            
+        Returns:
+            Dict: Торговый сигнал {action, confidence, reason}
+        """
+        try:
+            # Получаем историю последних свечей для символа
+            if symbol not in self.historical_data or len(self.historical_data[symbol]) < 20:
+                return {'action': 'hold', 'confidence': 0.0, 'reason': 'Недостаточно данных'}
+            
+            # Находим индекс текущей свечи
+            current_idx = self.candle_indexes.get(symbol, 0)
+            if current_idx < 20:
+                return {'action': 'hold', 'confidence': 0.0, 'reason': 'Недостаточно истории'}
+            
+            # Берем последние 20 свечей для анализа
+            recent_candles = self.historical_data[symbol][max(0, current_idx-19):current_idx+1]
+            
+            # Простая стратегия на основе изменения цены
+            # Сравниваем текущую цену с средней за последние 10 свечей
+            prices = [c['close'] for c in recent_candles[-10:]]
+            avg_price = sum(prices) / len(prices) if prices else candle['close']
+            
+            current_price = candle['close']
+            price_change = ((current_price - avg_price) / avg_price) * 100
+            
+            # Анализ объема
+            volumes = [c['volume'] for c in recent_candles[-5:]]
+            avg_volume = sum(volumes) / len(volumes) if volumes else candle['volume']
+            volume_ratio = candle['volume'] / avg_volume if avg_volume > 0 else 1.0
+            
+            # Генерируем сигнал
+            # LONG: цена выше средней на 0.5%+ и объем выше среднего
+            if price_change > 0.5 and volume_ratio > 1.2:
+                confidence = min(0.75, 0.6 + (price_change / 10) + (volume_ratio - 1) * 0.1)
+                return {
+                    'action': 'long',
+                    'confidence': confidence,
+                    'reason': f'Momentum вверх: +{price_change:.2f}%, Vol: {volume_ratio:.2f}x'
+                }
+            
+            # SHORT: цена ниже средней на 0.5%+ и объем выше среднего
+            elif price_change < -0.5 and volume_ratio > 1.2:
+                confidence = min(0.75, 0.6 + (abs(price_change) / 10) + (volume_ratio - 1) * 0.1)
+                return {
+                    'action': 'short',
+                    'confidence': confidence,
+                    'reason': f'Momentum вниз: {price_change:.2f}%, Vol: {volume_ratio:.2f}x'
+                }
+            
+            # HOLD: нет четкого сигнала
+            else:
+                return {
+                    'action': 'hold',
+                    'confidence': 0.5,
+                    'reason': f'Нейтральный рынок: {price_change:.2f}%'
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка генерации сигнала для {symbol}: {e}")
+            return {'action': 'hold', 'confidence': 0.0, 'reason': 'Ошибка анализа'}
     
     def _create_backtest_record(self, symbols: List[str], interval: str,
                                 start_date: datetime, end_date: datetime) -> Optional[int]:

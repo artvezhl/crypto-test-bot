@@ -44,7 +44,14 @@
             }
         }
     },
-    "postCreateCommand": "mkdir -p logs backups && pip install -r requirements.txt",
-    "postStartCommand": "echo 'PostgreSQL and Trading Bot are ready'",
+    "forwardPorts": [5000],
+    "portsAttributes": {
+        "5000": {
+            "label": "Backtesting Web UI",
+            "onAutoForward": "notify"
+        }
+    },
+    "postCreateCommand": "mkdir -p logs backups data && pip install -r requirements.txt",
+    "postStartCommand": "echo 'PostgreSQL and Trading Bot are ready. Web UI available at http://localhost:5000'",
     "remoteUser": "vscode"
 }

@@ -6,7 +6,7 @@ numpy==1.26.4
 python-telegram-bot==20.7
 schedule==1.2.0
 pytz==2023.3  # Добавляем для работы с часовыми поясами
-python-telegram-bot==20.7
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
 types-psycopg2
+flask==3.0.0  # Для Web UI бэктестинга

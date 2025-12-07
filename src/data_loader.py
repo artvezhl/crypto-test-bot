@@ -399,3 +399,4 @@ class DataLoader:
             self.logger.error(f"❌ Ошибка получения статистики: {e}")
             return {}
 
+

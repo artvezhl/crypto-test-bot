@@ -8,11 +8,14 @@ Web UI для системы бэктестинга.
 - Анализа метрик
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 from datetime import datetime, timedelta
 import sys
 import os
 import logging
+import json
+from queue import Queue
+import threading
 
 # Добавляем родительскую директорию в путь для импортов
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,12 +34,113 @@ app.config['SECRET_KEY'] = 'your-secret-key-here'  # В production исполь�
 # Глобальные переменные для хранения последних результатов
 last_backtest_results = None
 last_backtest_engine = None
+progress_queue = Queue()
+backtest_running = False
 
 
 @app.route('/')
 def index():
     """Главная страница"""
     return render_template('index.html')
+
+
+@app.route('/api/progress')
+def progress():
+    """
+    SSE endpoint для отправки прогресса бэктеста в реальном времени.
+    """
+    def generate():
+        while True:
+            # Получаем сообщение из очереди (блокируется до получения)
+            message = progress_queue.get()
+            
+            # Если получили None, значит бэктест завершен
+            if message is None:
+                yield f"data: {json.dumps({'status': 'done'})}\n\n"
+                break
+                
+            # Отправляем прогресс клиенту
+            yield f"data: {json.dumps(message)}\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream')
+
+
+def run_backtest_async(symbols, interval, days, initial_balance, strategy, use_fees, use_slippage):
+    """
+    Запуск бэктеста в отдельном потоке с отправкой прогресса.
+    """
+    global last_backtest_results, last_backtest_engine, backtest_running
+    
+    try:
+        backtest_running = True
+        
+        # Создаем движок бэктестинга с выбранной стратегией
+        config = {'strategy': strategy}
+        engine = BacktestEngine(config=config)
+        engine.use_fees_in_backtest = use_fees
+        engine.use_slippage_in_backtest = use_slippage
+        
+        # Определяем период
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        # Отправляем начальный статус
+        progress_queue.put({
+            'status': 'running',
+            'progress': 0,
+            'message': 'Загрузка данных...'
+        })
+        
+        # Запускаем бэктест
+        results = engine.run_backtest(
+            symbols=symbols,
+            interval=interval,
+            start_date=start_date,
+            end_date=end_date,
+            initial_balance=initial_balance,
+            progress_callback=lambda p, msg: progress_queue.put({
+                'status': 'running',
+                'progress': p,
+                'message': msg
+            })
+        )
+        
+        if results:
+            # Добавляем дополнительную информацию
+            results['start_date'] = start_date.strftime('%Y-%m-%d %H:%M')
+            results['end_date'] = end_date.strftime('%Y-%m-%d %H:%M')
+            results['symbols'] = symbols
+            results['interval'] = interval
+            
+            # Сохраняем результаты глобально
+            last_backtest_results = results
+            last_backtest_engine = engine
+            
+            # Отправляем финальный статус
+            progress_queue.put({
+                'status': 'completed',
+                'progress': 100,
+                'message': 'Бэктест завершен!',
+                'results': results
+            })
+        else:
+            progress_queue.put({
+                'status': 'error',
+                'message': 'Бэктест не вернул результатов'
+            })
+            
+    except Exception as e:
+        logger.error(f"Ошибка выполнения бэктеста: {e}")
+        import traceback
+        traceback.print_exc()
+        progress_queue.put({
+            'status': 'error',
+            'message': str(e)
+        })
+    finally:
+        # Сигнализируем о завершении
+        progress_queue.put(None)
+        backtest_running = False
 
 
 @app.route('/api/run_backtest', methods=['POST'])
@@ -50,64 +154,55 @@ def run_backtest():
     - days: количество дней для тестирования
     - initial_balance: начальный баланс
     """
-    global last_backtest_results, last_backtest_engine
+    global backtest_running
     
     try:
+        # Проверяем, не запущен ли уже бэктест
+        if backtest_running:
+            return jsonify({'error': 'Бэктест уже выполняется'}), 400
+        
         data = request.get_json()
         
         # Парсим параметры
-        symbols = data.get('symbols', ['BTCUSDT', 'ETHUSDT'])
-        if isinstance(symbols, str):
-            symbols = [s.strip() for s in symbols.split(',')]
+        symbols_input = data.get('symbols', 'BTCUSDT,ETHUSDT')
+        if isinstance(symbols_input, str):
+            # Разделяем по запятым, переносам строк и пробелам
+            symbols = [s.strip() for s in symbols_input.replace('\n', ',').replace(' ', ',').split(',') if s.strip()]
+        else:
+            symbols = symbols_input
         
         interval = data.get('interval', '15')
         days = int(data.get('days', 7))
         initial_balance = float(data.get('initial_balance', 10000))
         
+        # Стратегия бэктестинга
+        strategy = data.get('strategy', 'simple')
+        
         # Настройки комиссий и slippage
         use_fees = data.get('use_fees', True)
         use_slippage = data.get('use_slippage', True)
         
-        logger.info(f"Запуск бэктеста: symbols={symbols}, interval={interval}, days={days}")
+        logger.info(f"Запуск бэктеста: symbols={symbols}, interval={interval}, days={days}, strategy={strategy}")
         
-        # Создаем движок бэктестинга
-        engine = BacktestEngine()
-        engine.use_fees_in_backtest = use_fees
-        engine.use_slippage_in_backtest = use_slippage
+        # Очищаем очередь прогресса
+        while not progress_queue.empty():
+            progress_queue.get()
         
-        # Определяем период
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        
-        # Запускаем бэктест
-        results = engine.run_backtest(
-            symbols=symbols,
-            interval=interval,
-            start_date=start_date,
-            end_date=end_date,
-            initial_balance=initial_balance
+        # Запускаем бэктест в отдельном потоке
+        thread = threading.Thread(
+            target=run_backtest_async,
+            args=(symbols, interval, days, initial_balance, strategy, use_fees, use_slippage)
         )
-        
-        if not results:
-            return jsonify({'error': 'Бэктест не вернул результатов'}), 500
-        
-        # Сохраняем результаты глобально
-        last_backtest_results = results
-        last_backtest_engine = engine
-        
-        # Добавляем дополнительную информацию
-        results['start_date'] = start_date.strftime('%Y-%m-%d %H:%M')
-        results['end_date'] = end_date.strftime('%Y-%m-%d %H:%M')
-        results['symbols'] = symbols
-        results['interval'] = interval
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
             'success': True,
-            'results': results
+            'message': 'Бэктест запущен'
         })
         
     except Exception as e:
-        logger.error(f"Ошибка выполнения бэктеста: {e}")
+        logger.error(f"Ошибка запуска бэктеста: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -279,4 +374,5 @@ if __name__ == '__main__':
     
     # Запускаем сервер
     app.run(debug=True, host='0.0.0.0', port=5000)
+
 

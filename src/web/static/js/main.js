@@ -2,14 +2,25 @@
 let balanceChart = null;
 let drawdownChart = null;
 let pnlChart = null;
+let eventSource = null;
 
 // Обработка отправки формы
 document.getElementById('backtestForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     
-    // Показываем индикатор загрузки
-    document.getElementById('loading').classList.remove('hidden');
+    // Дизейблим кнопку
+    const runButton = document.getElementById('runButton');
+    const buttonText = document.getElementById('buttonText');
+    runButton.disabled = true;
+    buttonText.textContent = 'Выполняется...';
+    
+    // Показываем прогресс-бар
+    document.getElementById('progressContainer').classList.remove('hidden');
     document.getElementById('results').classList.add('hidden');
+    document.getElementById('loading').classList.add('hidden');
+    
+    // Сбрасываем прогресс
+    updateProgress(0, 'Инициализация...');
     
     // Собираем параметры
     const params = {
@@ -17,11 +28,15 @@ document.getElementById('backtestForm').addEventListener('submit', async functio
         interval: document.getElementById('interval').value,
         days: parseInt(document.getElementById('days').value),
         initial_balance: parseFloat(document.getElementById('initial_balance').value),
+        strategy: document.getElementById('strategy').value,
         use_fees: document.getElementById('use_fees').checked,
         use_slippage: document.getElementById('use_slippage').checked
     };
     
     try {
+        // Подключаемся к SSE для получения прогресса
+        connectToProgress();
+        
         // Запускаем бэктест
         const response = await fetch('/api/run_backtest', {
             method: 'POST',
@@ -35,21 +50,78 @@ document.getElementById('backtestForm').addEventListener('submit', async functio
         
         if (!response.ok) {
             throw new Error(data.error || 'Ошибка выполнения бэктеста');
+            disconnectFromProgress();
+            resetUI();
         }
-        
-        // Отображаем результаты
-        displayResults(data.results);
-        
-        // Загружаем и отображаем графики
-        await loadCharts();
         
     } catch (error) {
         console.error('Ошибка:', error);
         alert('Ошибка: ' + error.message);
-    } finally {
-        document.getElementById('loading').classList.add('hidden');
+        disconnectFromProgress();
+        resetUI();
     }
 });
+
+// Подключение к SSE для получения прогресса
+function connectToProgress() {
+    // Закрываем предыдущее соединение если есть
+    disconnectFromProgress();
+    
+    eventSource = new EventSource('/api/progress');
+    
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        if (data.status === 'running') {
+            updateProgress(data.progress, data.message);
+        } else if (data.status === 'completed') {
+            updateProgress(100, 'Готово!');
+            displayResults(data.results);
+            loadCharts();
+            disconnectFromProgress();
+            resetUI();
+        } else if (data.status === 'error') {
+            alert('Ошибка: ' + data.message);
+            disconnectFromProgress();
+            resetUI();
+        } else if (data.status === 'done') {
+            disconnectFromProgress();
+        }
+    };
+    
+    eventSource.onerror = function(error) {
+        console.error('SSE Error:', error);
+        disconnectFromProgress();
+    };
+}
+
+// Отключение от SSE
+function disconnectFromProgress() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+}
+
+// Обновление прогресс-бара
+function updateProgress(percent, message) {
+    document.getElementById('progressBar').style.width = percent + '%';
+    document.getElementById('progressPercent').textContent = Math.round(percent) + '%';
+    document.getElementById('progressMessage').textContent = message;
+}
+
+// Сброс UI после завершения
+function resetUI() {
+    const runButton = document.getElementById('runButton');
+    const buttonText = document.getElementById('buttonText');
+    runButton.disabled = false;
+    buttonText.textContent = 'Запустить бэктест';
+    
+    // Скрываем прогресс-бар через 2 секунды
+    setTimeout(() => {
+        document.getElementById('progressContainer').classList.add('hidden');
+    }, 2000);
+}
 
 function displayResults(results) {
     // Показываем блок с результатами
@@ -334,4 +406,5 @@ window.addEventListener('DOMContentLoaded', async function() {
         console.error('Ошибка загрузки настроек:', error);
     }
 });
+
 

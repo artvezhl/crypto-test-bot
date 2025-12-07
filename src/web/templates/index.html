@@ -10,6 +10,14 @@
     
     <!-- Tailwind CSS для стилей -->
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // Подавляем предупреждение о production для dev окружения
+        tailwind.config = {
+            corePlugins: {
+                preflight: true,
+            }
+        }
+    </script>
     
     <!-- Font Awesome для иконок -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
@@ -70,12 +78,13 @@
             </h2>
             
             <form id="backtestForm" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div>
+                <div class="md:col-span-2">
                     <label class="block text-sm font-medium text-gray-700 mb-2">
-                        Символы
+                        Символы <span class="text-gray-500 text-xs">(по одному на строку или через запятую)</span>
                     </label>
-                    <input type="text" id="symbols" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500" 
-                           placeholder="BTCUSDT,ETHUSDT" value="BTCUSDT,ETHUSDT">
+                    <textarea id="symbols" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm" 
+                           placeholder="BTCUSDT&#10;ETHUSDT&#10;SOLUSDT">BTCUSDT
+ETHUSDT</textarea>
                 </div>
                 
                 <div>
@@ -109,6 +118,17 @@
                            value="10000" min="100" step="100">
                 </div>
                 
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">
+                        Стратегия
+                    </label>
+                    <select id="strategy" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500">
+                        <option value="simple" selected>Быстрая (Техническая)</option>
+                        <option value="deepseek">DeepSeek AI (Медленно)</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">Быстрая: ~20-40сек, AI: ~30-60мин</p>
+                </div>
+                
                 <div class="flex items-center">
                     <input type="checkbox" id="use_fees" class="mr-2 h-4 w-4 text-purple-600 focus:ring-purple-500 border-gray-300 rounded" checked>
                     <label for="use_fees" class="text-sm font-medium text-gray-700">
@@ -124,15 +144,34 @@
                 </div>
                 
                 <div class="md:col-span-2 lg:col-span-2">
-                    <button type="submit" id="runButton" class="w-full gradient-bg text-white font-bold py-3 px-6 rounded-md hover:opacity-90 transition duration-200">
+                    <button type="submit" id="runButton" class="w-full gradient-bg text-white font-bold py-3 px-6 rounded-md hover:opacity-90 transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
                         <i class="fas fa-play mr-2"></i>
-                        Запустить бэктест
+                        <span id="buttonText">Запустить бэктест</span>
                     </button>
                 </div>
             </form>
         </div>
 
-        <!-- Индикатор загрузки -->
+        <!-- Прогресс-бар -->
+        <div id="progressContainer" class="hidden bg-white rounded-lg shadow-md p-6 mb-8">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-semibold text-gray-800">
+                    <i class="fas fa-spinner fa-spin mr-2 text-purple-600"></i>
+                    Выполняется бэктест
+                </h3>
+                <span id="progressPercent" class="text-sm font-medium text-purple-600">0%</span>
+            </div>
+            
+            <!-- Прогресс-бар -->
+            <div class="w-full bg-gray-200 rounded-full h-3 mb-3 overflow-hidden">
+                <div id="progressBar" class="gradient-bg h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+            
+            <!-- Статус -->
+            <p id="progressMessage" class="text-sm text-gray-600">Инициализация...</p>
+        </div>
+
+        <!-- Индикатор загрузки (устаревший, оставлен для совместимости) -->
         <div id="loading" class="hidden text-center py-12">
             <div class="loading mx-auto mb-4"></div>
             <p class="text-gray-600">Выполняется бэктест...</p>
@@ -257,4 +296,5 @@
     <script src="/static/js/main.js"></script>
 </body>
 </html>
+
 

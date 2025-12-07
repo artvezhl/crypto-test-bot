@@ -201,3 +201,4 @@ def get_performance_summary() -> str:
     
     return "\n".join(lines)
 
+
