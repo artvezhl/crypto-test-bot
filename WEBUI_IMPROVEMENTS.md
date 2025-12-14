@@ -239,3 +239,7 @@ Sharpe Ratio: 2.14 ✅ Очень хорошо
 **Проект:** Crypto Trading Bot  
 **Статус:** ✅ Production Ready
 
+
+
+
+

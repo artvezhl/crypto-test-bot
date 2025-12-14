@@ -4,8 +4,26 @@ let drawdownChart = null;
 let pnlChart = null;
 let eventSource = null;
 
-// Обработка отправки формы
-document.getElementById('backtestForm').addEventListener('submit', async function(e) {
+// Пагинация таблицы сделок
+let allTrades = [];
+let currentTradesPage = 1;
+const tradesPerPage = 50;
+
+// Переподключение SSE
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 10;
+let reconnectTimeout = null;
+
+// Инициализация при загрузке DOM
+window.addEventListener('DOMContentLoaded', function() {
+    // Обработка отправки формы
+    const backtestForm = document.getElementById('backtestForm');
+    if (!backtestForm) {
+        console.error('❌ Форма backtestForm не найдена');
+        return;
+    }
+    
+    backtestForm.addEventListener('submit', async function(e) {
     e.preventDefault();
     
     // Дизейблим кнопку
@@ -60,47 +78,109 @@ document.getElementById('backtestForm').addEventListener('submit', async functio
         disconnectFromProgress();
         resetUI();
     }
-});
+    });
+}); // Конец DOMContentLoaded
 
 // Подключение к SSE для получения прогресса
 function connectToProgress() {
     // Закрываем предыдущее соединение если есть
     disconnectFromProgress();
     
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    
+    reconnectAttempts = 0;
+    
     eventSource = new EventSource('/api/progress');
     
+    eventSource.onopen = function() {
+        console.log('SSE соединение установлено');
+        reconnectAttempts = 0; // Сбрасываем счетчик при успешном подключении
+    };
+    
     eventSource.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        
-        if (data.status === 'running') {
-            updateProgress(data.progress, data.message);
-        } else if (data.status === 'completed') {
-            updateProgress(100, 'Готово!');
-            displayResults(data.results);
-            loadCharts();
-            disconnectFromProgress();
-            resetUI();
-        } else if (data.status === 'error') {
-            alert('Ошибка: ' + data.message);
-            disconnectFromProgress();
-            resetUI();
-        } else if (data.status === 'done') {
-            disconnectFromProgress();
+        try {
+            const data = JSON.parse(event.data);
+            
+            if (data.status === 'running') {
+                updateProgress(data.progress, data.message);
+            } else if (data.status === 'completed') {
+                updateProgress(100, 'Готово!');
+                displayResults(data.results);
+                loadCharts();
+                disconnectFromProgress();
+                resetUI();
+            } else if (data.status === 'error') {
+                alert('Ошибка: ' + data.message);
+                disconnectFromProgress();
+                resetUI();
+            } else if (data.status === 'done') {
+                disconnectFromProgress();
+            }
+        } catch (e) {
+            console.error('Ошибка парсинга SSE данных:', e);
         }
     };
     
     eventSource.onerror = function(error) {
         console.error('SSE Error:', error);
-        disconnectFromProgress();
+        
+        // Проверяем состояние соединения
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+            // Соединение закрыто - пытаемся переподключиться
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = Math.min(1000 * reconnectAttempts, 5000); // Максимум 5 секунд
+                
+                console.log(`Попытка переподключения ${reconnectAttempts}/${maxReconnectAttempts} через ${delay}ms...`);
+                
+                // Проверяем состояние бэктеста перед переподключением
+                checkBacktestStatus().then(isRunning => {
+                    if (isRunning) {
+                        reconnectTimeout = setTimeout(() => {
+                            connectToProgress();
+                        }, delay);
+                    } else {
+                        console.log('Бэктест завершен, переподключение не требуется');
+                        disconnectFromProgress();
+                    }
+                });
+            } else {
+                console.error('Превышено максимальное количество попыток переподключения');
+                updateProgress(0, 'Ошибка соединения. Проверьте состояние бэктеста.');
+                disconnectFromProgress();
+            }
+        }
     };
+}
+
+// Проверка состояния бэктеста
+async function checkBacktestStatus() {
+    try {
+        const response = await fetch('/api/backtest_status');
+        const data = await response.json();
+        return data.running === true;
+    } catch (error) {
+        console.error('Ошибка проверки статуса:', error);
+        return false;
+    }
 }
 
 // Отключение от SSE
 function disconnectFromProgress() {
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    
     if (eventSource) {
         eventSource.close();
         eventSource = null;
     }
+    
+    reconnectAttempts = 0;
 }
 
 // Обновление прогресс-бара
@@ -128,10 +208,47 @@ function displayResults(results) {
     document.getElementById('results').classList.remove('hidden');
     
     // Базовые метрики
+    console.log('📊 Результаты бэктеста:', {
+        roi_percent: results.roi_percent,
+        total_pnl: results.total_pnl,
+        win_rate: results.win_rate,
+        max_drawdown: results.max_drawdown,
+        winning_trades: results.winning_trades,
+        total_trades: results.total_trades
+    });
     displayMetric('roi', results.roi_percent, '%', true);
     displayMetric('total_pnl', results.total_pnl, '$', true);
-    displayMetric('win_rate', results.win_rate, '%', false);
-    displayMetric('max_drawdown', results.max_drawdown, '%', false, true);
+    
+    // Win Rate - проверяем что значение есть
+    const winRateValue = results.win_rate || 0;
+    const winRateElement = document.getElementById('win_rate');
+    console.log('🎯 Обновление Win Rate:', { 
+        winRateValue, 
+        element: winRateElement,
+        elementTextBefore: winRateElement?.textContent,
+        elementVisible: winRateElement ? window.getComputedStyle(winRateElement).display !== 'none' : false
+    });
+    displayMetric('win_rate', winRateValue, '%');
+    
+    // Убеждаемся что win_rate имеет видимый цвет (не белый)
+    const winRateEl = document.getElementById('win_rate');
+    if (winRateEl) {
+        winRateEl.style.color = '#111827'; // Темно-серый цвет (gray-900)
+        winRateEl.classList.remove('metric-positive', 'metric-negative', 'text-white');
+    }
+    
+    // Проверяем после обновления
+    setTimeout(() => {
+        const afterElement = document.getElementById('win_rate');
+        console.log('🔍 Win Rate после обновления:', {
+            textContent: afterElement?.textContent,
+            innerHTML: afterElement?.innerHTML,
+            visible: afterElement ? window.getComputedStyle(afterElement).display !== 'none' : false
+        });
+    }, 100);
+    
+    // Max Drawdown - не используем colorize, чтобы текст был виден
+    displayMetric('max_drawdown', results.max_drawdown || 0, '%', false);
     
     // Win ratio
     document.getElementById('win_ratio').textContent = 
@@ -165,11 +282,39 @@ function displayResults(results) {
 
 function displayMetric(id, value, suffix = '', colorize = false, inverse = false) {
     const element = document.getElementById(id);
-    const formatted = value.toFixed(2) + suffix;
+    if (!element) {
+        console.warn(`⚠️ Элемент с ID "${id}" не найден в DOM`);
+        return;
+    }
+    
+    // Проверяем, что значение существует и является числом
+    if (value === undefined || value === null || isNaN(value)) {
+        console.warn(`⚠️ Значение для "${id}" невалидно:`, value);
+        element.textContent = '-';
+        return;
+    }
+    
+    const numValue = Number(value);
+    if (isNaN(numValue)) {
+        console.warn(`⚠️ Не удалось преобразовать значение для "${id}" в число:`, value);
+        element.textContent = '-';
+        return;
+    }
+    
+    const formatted = numValue.toFixed(2) + suffix;
     element.textContent = formatted;
     
+    // Для win_rate и max_drawdown устанавливаем явный темный цвет текста
+    if (id === 'win_rate' || id === 'max_drawdown') {
+        element.style.color = '#111827'; // Темно-серый цвет (gray-900)
+        element.classList.remove('metric-positive', 'metric-negative', 'text-white');
+        if (id === 'win_rate') {
+            console.log(`✅ Обновлен ${id}: ${formatted} (значение: ${numValue})`);
+        }
+    }
+    
     if (colorize) {
-        if ((value > 0 && !inverse) || (value < 0 && inverse)) {
+        if ((numValue > 0 && !inverse) || (numValue < 0 && inverse)) {
             element.classList.add('metric-positive');
             element.classList.remove('metric-negative');
         } else {
@@ -194,29 +339,241 @@ function colorizeMetric(id, value, goodThreshold, excellentThreshold) {
 async function loadCharts() {
     try {
         // Загружаем данные для всех графиков параллельно
+        const balancePromise = fetch('/api/chart_data/balance')
+            .then(r => r.ok ? r.json() : { error: 'Нет данных' })
+            .catch(() => ({ error: 'Ошибка загрузки' }));
+        const drawdownPromise = fetch('/api/chart_data/drawdown')
+            .then(r => r.ok ? r.json() : { error: 'Нет данных' })
+            .catch(() => ({ error: 'Ошибка загрузки' }));
+        const pnlPromise = fetch('/api/chart_data/pnl_distribution')
+            .then(r => r.ok ? r.json() : { pnls: [] })
+            .catch(() => ({ pnls: [] }));
+        
         const [balanceData, drawdownData, pnlData] = await Promise.all([
-            fetch('/api/chart_data/balance').then(r => r.json()),
-            fetch('/api/chart_data/drawdown').then(r => r.json()),
-            fetch('/api/chart_data/pnl_distribution').then(r => r.json())
+            balancePromise,
+            drawdownPromise,
+            pnlPromise
         ]);
         
+        console.log('📊 Данные графиков:', {
+            balance: balanceData.error ? 'Ошибка' : `OK (${balanceData.timestamps?.length || 0} точек)`,
+            drawdown: drawdownData.error ? 'Ошибка' : 'OK',
+            pnl: pnlData.pnls?.length || 0
+        });
+        
         // Создаем графики
+        if (!balanceData.error) {
         createBalanceChart(balanceData);
+        } else {
+            console.log('⏸️ График баланса недоступен:', balanceData.error);
+        }
+        if (!drawdownData.error) {
         createDrawdownChart(drawdownData);
+        } else {
+            console.log('⏸️ График просадки недоступен:', drawdownData.error);
+        }
+        
+        // Создаем график PnL (с проверкой данных внутри функции)
         createPnlChart(pnlData);
+        
+        // Загружаем таблицу сделок
+        await loadTrades();
         
     } catch (error) {
         console.error('Ошибка загрузки графиков:', error);
     }
 }
 
+async function loadTrades() {
+    try {
+        console.log('🔄 Загрузка сделок...');
+        const response = await fetch('/api/trades');
+        const data = await response.json();
+        
+        console.log('📊 Данные сделок:', { 
+            tradesCount: data.trades?.length || 0, 
+            summary: data.summary,
+            error: data.error 
+        });
+        
+        if (data.error) {
+            console.error('Ошибка загрузки сделок:', data.error);
+            return;
+        }
+        
+        const tradesContainer = document.getElementById('tradesTableContainer');
+        const tradesTableBody = document.getElementById('tradesTableBody');
+        const tradesSummary = document.getElementById('tradesSummary');
+        
+        if (!tradesContainer || !tradesTableBody) {
+            console.error('❌ Элементы таблицы сделок не найдены в DOM');
+            return;
+        }
+        
+        if (!data.trades || data.trades.length === 0) {
+            console.log('⏸️ Нет сделок для отображения');
+            tradesContainer.style.display = 'none';
+            return;
+        }
+        
+        // Сохраняем все сделки для пагинации
+        allTrades = data.trades;
+        currentTradesPage = 1;
+        
+        // Показываем контейнер
+        tradesContainer.style.display = 'block';
+        // Убеждаемся, что контейнер виден
+        tradesContainer.classList.remove('hidden');
+        console.log('✅ Контейнер таблицы сделок показан', {
+            container: tradesContainer,
+            display: tradesContainer.style.display,
+            allTradesCount: allTrades.length,
+            classList: tradesContainer.classList.toString()
+        });
+        
+        // Обновляем summary
+        const summary = data.summary;
+        if (tradesSummary) {
+            tradesSummary.innerHTML = `
+                Всего: <span class="font-semibold">${summary.total}</span> | 
+                Прибыльных: <span class="font-semibold text-green-600">${summary.winning}</span> | 
+                Убыточных: <span class="font-semibold text-red-600">${summary.losing}</span> | 
+                Win Rate: <span class="font-semibold">${summary.win_rate.toFixed(1)}%</span>
+            `;
+        }
+        
+        // Отображаем первую страницу
+        console.log('📋 Рендеринг таблицы сделок...');
+        renderTradesPage();
+        console.log('✅ Таблица сделок отображена');
+        
+    } catch (error) {
+        console.error('Ошибка загрузки таблицы сделок:', error);
+    }
+}
+
+function renderTradesPage() {
+    console.log('🔄 renderTradesPage вызвана', { allTradesLength: allTrades?.length, currentPage: currentTradesPage });
+    
+    const tradesTableBody = document.getElementById('tradesTableBody');
+    const tradesPagination = document.getElementById('tradesPagination');
+    const tradesShown = document.getElementById('tradesShown');
+    const tradesTotal = document.getElementById('tradesTotal');
+    const tradesPageInfo = document.getElementById('tradesPageInfo');
+    const tradesPrevBtn = document.getElementById('tradesPrevBtn');
+    const tradesNextBtn = document.getElementById('tradesNextBtn');
+    
+    if (!tradesTableBody) {
+        console.error('❌ tradesTableBody не найден');
+        return;
+    }
+    
+    if (!allTrades || allTrades.length === 0) {
+        console.log('⏸️ Нет сделок для рендеринга');
+        if (tradesPagination) {
+            tradesPagination.style.display = 'none';
+        }
+        return;
+    }
+    
+    // Вычисляем пагинацию
+    const totalPages = Math.ceil(allTrades.length / tradesPerPage);
+    const startIdx = (currentTradesPage - 1) * tradesPerPage;
+    const endIdx = Math.min(startIdx + tradesPerPage, allTrades.length);
+    const pageTrades = allTrades.slice(startIdx, endIdx);
+    
+    // Очищаем таблицу
+    tradesTableBody.innerHTML = '';
+    console.log(`📋 Рендеринг ${pageTrades.length} сделок (страница ${currentTradesPage} из ${totalPages})`);
+    
+    // Заполняем таблицу только текущей страницей
+    pageTrades.forEach((trade, index) => {
+        if (index === 0) {
+            console.log('📊 Пример сделки:', trade);
+        }
+        const row = document.createElement('tr');
+        row.className = 'hover:bg-gray-50';
+        
+        // Определяем цвет для PnL
+        const pnlColor = trade.realized_pnl > 0 ? 'text-green-600 font-semibold' : 
+                       trade.realized_pnl < 0 ? 'text-red-600 font-semibold' : 
+                       'text-gray-600';
+        
+        // Направление
+        const sideClass = trade.side === 'BUY' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800';
+        const sideText = trade.side === 'BUY' ? 'LONG' : 'SHORT';
+        
+        row.innerHTML = `
+            <td class="px-4 py-3 text-sm text-gray-900">#${trade.id}</td>
+            <td class="px-4 py-3 text-sm font-medium text-gray-900">${trade.symbol}</td>
+            <td class="px-4 py-3 text-sm">
+                <span class="px-2 py-1 text-xs font-semibold rounded ${sideClass}">${sideText}</span>
+            </td>
+            <td class="px-4 py-3 text-sm text-right text-gray-900">${trade.size.toFixed(6)}</td>
+            <td class="px-4 py-3 text-sm text-right text-gray-900">$${trade.entry_price.toFixed(2)}</td>
+            <td class="px-4 py-3 text-sm text-right text-gray-900">$${trade.exit_price.toFixed(2)}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${trade.created_at_date || 'N/A'}</td>
+            <td class="px-4 py-3 text-sm text-gray-600" title="${trade.created_at || 'N/A'}">${trade.created_at_short || 'N/A'}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${trade.closed_at_date || 'N/A'}</td>
+            <td class="px-4 py-3 text-sm text-gray-600" title="${trade.closed_at || 'N/A'}">${trade.closed_at_short || 'N/A'}</td>
+            <td class="px-4 py-3 text-sm text-right ${pnlColor}">$${trade.realized_pnl.toFixed(2)}</td>
+            <td class="px-4 py-3 text-sm text-right ${pnlColor}">${trade.pnl_percent.toFixed(2)}%</td>
+            <td class="px-4 py-3 text-sm text-right text-gray-600">$${trade.total_fees.toFixed(4)}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${trade.duration}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${trade.close_reason}</td>
+        `;
+        
+        tradesTableBody.appendChild(row);
+    });
+    
+    // Обновляем пагинацию
+    if (totalPages > 1) {
+        tradesPagination.style.display = 'flex';
+        tradesShown.textContent = `${startIdx + 1}-${endIdx}`;
+        tradesTotal.textContent = allTrades.length;
+        tradesPageInfo.textContent = `Страница ${currentTradesPage} из ${totalPages}`;
+        
+        tradesPrevBtn.disabled = currentTradesPage === 1;
+        tradesNextBtn.disabled = currentTradesPage === totalPages;
+    } else {
+        tradesPagination.style.display = 'none';
+    }
+}
+
+function changeTradesPage(direction) {
+    const totalPages = Math.ceil(allTrades.length / tradesPerPage);
+    const newPage = currentTradesPage + direction;
+    
+    if (newPage >= 1 && newPage <= totalPages) {
+        currentTradesPage = newPage;
+        renderTradesPage();
+    }
+}
+
 function createBalanceChart(data) {
-    const ctx = document.getElementById('balanceChart').getContext('2d');
+    if (!data || !data.timestamps || !data.balances || data.timestamps.length === 0) {
+        console.log('⏸️ Нет данных для графика баланса');
+        return;
+    }
+    
+    const balanceChartElement = document.getElementById('balanceChart');
+    if (!balanceChartElement) {
+        console.error('❌ Элемент balanceChart не найден');
+        return;
+    }
+    
+    const ctx = balanceChartElement.getContext('2d');
     
     // Уничтожаем предыдущий график если есть
     if (balanceChart) {
         balanceChart.destroy();
     }
+    
+    console.log('📊 Создание графика баланса:', {
+        timestampsCount: data.timestamps.length,
+        balancesCount: data.balances.length,
+        initialBalance: data.initial_balance
+    });
     
     balanceChart = new Chart(ctx, {
         type: 'line',
@@ -328,30 +685,80 @@ function createDrawdownChart(data) {
 }
 
 function createPnlChart(data) {
+    const pnlChartCard = document.getElementById('pnlChartCard');
+    
+    if (!data || !data.pnls || data.pnls.length === 0) {
+        console.log('⏸️ Нет данных для графика PnL');
+        // Скрываем контейнер графика, если нет данных
+        if (pnlChartCard) {
+            pnlChartCard.style.display = 'none';
+        }
+        if (pnlChart) {
+            pnlChart.destroy();
+            pnlChart = null;
+        }
+        return;
+    }
+    
+    // Показываем контейнер, если есть данные
+    if (pnlChartCard) {
+        pnlChartCard.style.display = 'block';
+    }
+    
     const ctx = document.getElementById('pnlChart').getContext('2d');
     
     if (pnlChart) {
         pnlChart.destroy();
     }
     
+    // Ограничиваем количество данных для производительности (максимум 100)
+    const maxBars = 100;
+    let displayData = data;
+    if (data.pnls.length > maxBars) {
+        // Берем последние maxBars сделок
+        const startIdx = data.pnls.length - maxBars;
+        displayData = {
+            trade_numbers: data.trade_numbers.slice(startIdx),
+            pnls: data.pnls.slice(startIdx),
+            symbols: data.symbols.slice(startIdx),
+            sides: data.sides.slice(startIdx)
+        };
+    }
+    
     // Раскрашиваем бары в зависимости от прибыли/убытка
-    const colors = data.pnls.map(pnl => pnl >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(239, 68, 68, 0.8)');
+    const colors = displayData.pnls.map(pnl => pnl >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(239, 68, 68, 0.8)');
+    
+    // Вычисляем разумные границы для масштабирования
+    const minPnL = Math.min(...displayData.pnls);
+    const maxPnL = Math.max(...displayData.pnls);
+    const range = maxPnL - minPnL;
+    const padding = range * 0.1; // 10% отступ
     
     pnlChart = new Chart(ctx, {
         type: 'bar',
         data: {
-            labels: data.trade_numbers,
+            labels: displayData.trade_numbers,
             datasets: [{
                 label: 'PnL ($)',
-                data: data.pnls,
+                data: displayData.pnls,
                 backgroundColor: colors,
                 borderColor: colors.map(c => c.replace('0.8', '1')),
-                borderWidth: 1
+                borderWidth: 1,
+                maxBarThickness: 50 // Ограничиваем ширину баров
             }]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            layout: {
+                padding: {
+                    top: 10,
+                    bottom: 10
+                }
+            },
+            animation: {
+                duration: 0 // Отключаем анимацию для производительности
+            },
             interaction: {
                 intersect: false,
                 mode: 'index'
@@ -364,7 +771,7 @@ function createPnlChart(data) {
                     callbacks: {
                         title: function(context) {
                             const idx = context[0].dataIndex;
-                            return `Сделка #${data.trade_numbers[idx]} (${data.symbols[idx]} ${data.sides[idx]})`;
+                            return `Сделка #${displayData.trade_numbers[idx]} (${displayData.symbols[idx]} ${displayData.sides[idx]})`;
                         },
                         label: function(context) {
                             return 'PnL: $' + context.parsed.y.toFixed(2);
@@ -374,17 +781,26 @@ function createPnlChart(data) {
             },
             scales: {
                 y: {
-                    beginAtZero: true,
+                    beginAtZero: false, // Не начинаем с нуля для лучшего масштабирования
+                    suggestedMin: minPnL - padding,
+                    suggestedMax: maxPnL + padding,
                     ticks: {
                         callback: function(value) {
                             return '$' + value.toFixed(0);
-                        }
+                        },
+                        maxTicksLimit: 10 // Ограничиваем количество меток
+                    },
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.05)'
                     }
                 },
                 x: {
                     title: {
                         display: true,
                         text: 'Номер сделки'
+                    },
+                    ticks: {
+                        maxTicksLimit: 20 // Ограничиваем количество меток на оси X
                     }
                 }
             }
@@ -399,6 +815,13 @@ window.addEventListener('DOMContentLoaded', async function() {
         const settings = await response.json();
         
         // Заполняем форму настройками из БД
+        
+        // Пытаемся загрузить сделки, если бэктест уже был выполнен
+        try {
+            await loadTrades();
+        } catch (e) {
+            console.log('Бэктест еще не выполнен или нет сделок');
+        }
         if (settings.symbols) {
             document.getElementById('symbols').value = settings.symbols;
         }
@@ -406,5 +829,16 @@ window.addEventListener('DOMContentLoaded', async function() {
         console.error('Ошибка загрузки настроек:', error);
     }
 });
+
+// Экспорт сделок в CSV
+function exportTradesCSV() {
+    window.location.href = '/api/export/trades/csv';
+}
+
+// Экспорт результатов в JSON
+function exportResultsJSON() {
+    window.location.href = '/api/export/results/json';
+}
+
 
 

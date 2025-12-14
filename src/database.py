@@ -467,28 +467,32 @@ class Database:
             if self.db_type == 'postgresql':
                 with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                     cursor.execute(query, params)
+                    result = None
                     if fetch and query.strip().upper().startswith('SELECT'):
                         result = cursor.fetchall()
                         return [dict(row) for row in result]
                     elif fetch and query.strip().upper().startswith('INSERT'):
                         if 'RETURNING' in query.upper():
                             result = cursor.fetchone()
-                            return dict(result) if result else None
+                            result = dict(result) if result else None
+                    # Коммитим перед return
                     conn.commit()
-                    return None
+                    return result
             else:
                 # SQLite
                 cursor = conn.cursor()
                 cursor.execute(query, params or [])
+                result = None
                 if fetch and query.strip().upper().startswith('SELECT'):
                     columns = [col[0] for col in cursor.description]
-                    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+                    result = [dict(zip(columns, row)) for row in cursor.fetchall()]
                 elif fetch and query.strip().upper().startswith('INSERT'):
                     if 'RETURNING' in query.upper():
                         # SQLite doesn't support RETURNING, use lastrowid
-                        return {'id': cursor.lastrowid}
+                        result = {'id': cursor.lastrowid}
+                # Коммитим перед return
                 conn.commit()
-                return None
+                return result
 
         except Exception as e:
             if conn:
@@ -904,32 +908,46 @@ class Database:
 
     def add_virtual_position(self, symbol: str, side: str, size: float, entry_price: float,
                              leverage: int = 1, stop_loss: float | None = None,
-                             take_profit: float | None = None, entry_fee: float = 0.0) -> int:
-        """Добавление новой виртуальной позиции с валидацией параметров"""
+                             take_profit: float | None = None, entry_fee: float = 0.0,
+                             created_at: datetime | None = None) -> int:
+        """Добавление новой виртуальной позиции с валидацией параметров
+        
+        Args:
+            created_at: Время создания позиции (для бэктеста - время свечи, иначе текущее время)
+        """
         try:
             # Валидация входных данных
             self._validate_position_params(symbol, side, size, entry_price, leverage, stop_loss, take_profit)
+            
+            # Если время не указано, используем текущее
+            if created_at is None:
+                created_at = datetime.now()
+            
             if self.db_type == 'postgresql':
                 query = """
-                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """
             else:
                 query = """
-                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO virtual_positions (symbol, side, size, entry_price, current_price, leverage, stop_loss, take_profit, entry_fee, total_fees, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             params = (symbol, side, size, entry_price, entry_price,
-                      leverage, stop_loss, take_profit, entry_fee, entry_fee)
+                      leverage, stop_loss, take_profit, entry_fee, entry_fee, created_at)
             result = self._execute_query(query, params, fetch=True)
 
-            position_id = result['id'] if result else None
-            if not position_id and self.db_type == 'sqlite':
-                # Для SQLite получаем lastrowid
-                position_id = self._execute_query(
-                    "SELECT last_insert_rowid() as id")[0]['id']
+            position_id = None
+            if result:
+                if self.db_type == 'postgresql':
+                    # PostgreSQL с RETURNING - результат уже в виде dict
+                    position_id = result.get('id') if isinstance(result, dict) else None
+                else:
+                    # SQLite - получаем lastrowid
+                    position_id = self._execute_query(
+                        "SELECT last_insert_rowid() as id")[0]['id']
 
             self.logger.info(
                 f"✅ Виртуальная позиция #{position_id} добавлена: {side} {size} {symbol}")
@@ -970,6 +988,30 @@ class Database:
         except Exception as e:
             self.logger.error(f"❌ Ошибка получения виртуальной позиции: {e}")
             return None
+
+    def get_virtual_closed_positions(self, limit: int = 100) -> List[Dict]:
+        """Получение закрытых виртуальных позиций"""
+        try:
+            if self.db_type == 'postgresql':
+                query = """
+                SELECT * FROM virtual_positions 
+                WHERE status = 'closed' 
+                ORDER BY closed_at DESC 
+                LIMIT %s
+                """
+            else:
+                query = """
+                SELECT * FROM virtual_positions 
+                WHERE status = 'closed' 
+                ORDER BY closed_at DESC 
+                LIMIT ?
+                """
+
+            result = self._execute_query(query, (limit,))
+            return [self._convert_row(row) for row in result] if result else []
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка получения закрытых позиций: {e}")
+            return []
 
     def update_virtual_position_price(self, position_id: int, current_price: float):
         """Обновление текущей цены виртуальной позиции и расчет PnL"""
@@ -1013,8 +1055,12 @@ class Database:
         except Exception as e:
             self.logger.error(f"❌ Ошибка обновления виртуальной позиции: {e}")
 
-    def close_virtual_position(self, position_id: int, exit_price: float, close_reason: str = "manual", exit_fee: float = 0.0):
-        """Закрытие виртуальной позиции с учетом комиссий"""
+    def close_virtual_position(self, position_id: int, exit_price: float, close_reason: str = "manual", exit_fee: float = 0.0, closed_at: datetime | None = None):
+        """Закрытие виртуальной позиции с учетом комиссий
+        
+        Args:
+            closed_at: Время закрытия позиции (для бэктеста - время свечи, иначе текущее время)
+        """
         try:
             position = self.get_virtual_position(position_id)
             if not position:
@@ -1037,13 +1083,44 @@ class Database:
             total_fees = entry_fee + exit_fee
             pnl_net = pnl_gross - total_fees
             pnl_percent = (pnl_net / (entry_price * size)) * 100 if (entry_price * size) > 0 else 0
+            
+            # Проверка корректности причины закрытия
+            if close_reason == "take_profit" and pnl_net < 0:
+                # Тейк-профит не может быть убыточным
+                self.logger.warning(
+                    f"⚠️ Несоответствие: позиция #{position_id} закрыта как 'take_profit' но PnL отрицательный (${pnl_net:.2f}). "
+                    f"Меняем причину на 'stop_loss'"
+                )
+                close_reason = "stop_loss"
+            elif close_reason == "stop_loss" and pnl_net > 0:
+                # Стоп-лосс не может быть прибыльным (хотя теоретически возможно при сильном движении)
+                # Но если цена вышла за тейк-профит, это должно быть take_profit
+                stop_loss = position.get('stop_loss')
+                take_profit = position.get('take_profit')
+                if stop_loss and take_profit:
+                    if side == 'BUY' and exit_price >= take_profit:
+                        self.logger.warning(
+                            f"⚠️ Несоответствие: позиция #{position_id} закрыта как 'stop_loss' но цена выше тейк-профита. "
+                            f"Меняем причину на 'take_profit'"
+                        )
+                        close_reason = "take_profit"
+                    elif side == 'SELL' and exit_price <= take_profit:
+                        self.logger.warning(
+                            f"⚠️ Несоответствие: позиция #{position_id} закрыта как 'stop_loss' но цена ниже тейк-профита. "
+                            f"Меняем причину на 'take_profit'"
+                        )
+                        close_reason = "take_profit"
 
+            # Если время не указано, используем текущее
+            if closed_at is None:
+                closed_at = datetime.now()
+            
             if self.db_type == 'postgresql':
                 query = """
                 UPDATE virtual_positions 
                 SET status = 'closed', exit_price = %s, realized_pnl = %s, pnl_percent = %s, 
                     exit_fee = %s, total_fees = %s,
-                    close_reason = %s, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    close_reason = %s, closed_at = %s, updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """
             else:
@@ -1051,11 +1128,11 @@ class Database:
                 UPDATE virtual_positions 
                 SET status = 'closed', exit_price = ?, realized_pnl = ?, pnl_percent = ?, 
                     exit_fee = ?, total_fees = ?,
-                    close_reason = ?, closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    close_reason = ?, closed_at = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """
 
-            params = (exit_price, pnl_net, pnl_percent, exit_fee, total_fees, close_reason, position_id)
+            params = (exit_price, pnl_net, pnl_percent, exit_fee, total_fees, close_reason, closed_at, position_id)
             self._execute_query(query, params, fetch=False)
             self.logger.info(
                 f"✅ Виртуальная позиция #{position_id} закрыта. PnL: {pnl_net:.2f} USDT (комиссии: {total_fees:.4f} USDT)")
@@ -1111,6 +1188,61 @@ class Database:
             self.logger.error(
                 f"❌ Ошибка получения статистики виртуальной торговли: {e}")
             return {}
+
+    def clear_virtual_positions(self) -> bool:
+        """
+        Очищает все виртуальные позиции из базы данных.
+        Используется перед началом нового бэктеста для чистых результатов.
+        
+        Returns:
+            bool: True если успешно очищено
+        """
+        try:
+            # Проверяем количество позиций до очистки
+            count_before = self._execute_query("SELECT COUNT(*) as count FROM virtual_positions")
+            count_before_num = count_before[0]['count'] if count_before else 0
+            
+            if self.db_type == 'postgresql':
+                # Используем TRUNCATE для быстрой очистки всех данных
+                # TRUNCATE быстрее чем DELETE и сбрасывает автоинкремент
+                query = "TRUNCATE TABLE virtual_positions RESTART IDENTITY CASCADE"
+            else:
+                # SQLite не поддерживает TRUNCATE, используем DELETE
+                # Также удаляем из связанных таблиц если есть
+                query = "DELETE FROM virtual_positions"
+            
+            self._execute_query(query, fetch=False)
+            
+            # Для SQLite также сбрасываем автоинкремент
+            if self.db_type == 'sqlite':
+                self._execute_query("DELETE FROM sqlite_sequence WHERE name='virtual_positions'", fetch=False)
+            
+            # Проверяем количество позиций после очистки
+            count_after = self._execute_query("SELECT COUNT(*) as count FROM virtual_positions")
+            count_after_num = count_after[0]['count'] if count_after else 0
+            
+            # Дополнительная проверка: если остались позиции, удаляем их принудительно
+            if count_after_num > 0:
+                self.logger.warning(f"⚠️ После очистки осталось {count_after_num} позиций, удаляем принудительно...")
+                self._execute_query("DELETE FROM virtual_positions", fetch=False)
+                count_after_final = self._execute_query("SELECT COUNT(*) as count FROM virtual_positions")
+                count_after_num = count_after_final[0]['count'] if count_after_final else 0
+            
+            self.logger.info(
+                f"🧹 Все виртуальные позиции очищены из БД "
+                f"(было: {count_before_num}, стало: {count_after_num})"
+            )
+            
+            if count_after_num > 0:
+                self.logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: После очистки осталось {count_after_num} позиций!")
+                return False
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка очистки виртуальных позиций: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def _create_historical_klines_table(self):
         """Создание таблицы для кеширования исторических данных"""

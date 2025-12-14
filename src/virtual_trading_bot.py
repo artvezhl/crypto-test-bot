@@ -384,12 +384,16 @@ class VirtualTradingBot:
 
     def _check_virtual_position_conditions(self, symbol: str, current_price: float):
         """Проверка условий для закрытия виртуальных позиций из БД"""
+        # Логируем входные данные для диагностики (DEBUG - слишком часто для INFO)
+        self.logger.debug(f"🔍 _check_virtual_position_conditions: symbol={symbol}, current_price=${current_price:,.2f}")
+        
         open_positions = self.db.get_virtual_open_positions(symbol)
         
         for position in open_positions:
             stop_loss = position.get('stop_loss')
             take_profit = position.get('take_profit')
 
+            # Если уровни не установлены, пропускаем проверку
             if not (stop_loss and take_profit):
                 continue
                 
@@ -397,6 +401,7 @@ class VirtualTradingBot:
             close_reason = ""
 
             if position['side'] == 'BUY':
+                # Для BUY: стоп-лосс ниже входа, тейк-профит выше входа
                 if current_price <= stop_loss:
                     should_close = True
                     close_reason = "stop_loss"
@@ -404,6 +409,7 @@ class VirtualTradingBot:
                     should_close = True
                     close_reason = "take_profit"
             else:  # SELL
+                # Для SELL: стоп-лосс выше входа, тейк-профит ниже входа
                 if current_price >= stop_loss:
                     should_close = True
                     close_reason = "stop_loss"
@@ -412,11 +418,85 @@ class VirtualTradingBot:
                     close_reason = "take_profit"
 
             if should_close:
+                # Дополнительная проверка: если причина take_profit, но цена не соответствует прибыли
+                entry_price = position.get('entry_price', 0)
+                if close_reason == "take_profit":
+                    if position['side'] == 'BUY' and current_price < entry_price:
+                        # Для BUY тейк-профит должен быть выше входа
+                        self.logger.warning(
+                            f"⚠️ Несоответствие: take_profit для BUY, но цена {current_price:.2f} < входа {entry_price:.2f}. "
+                            f"Меняем на stop_loss"
+                        )
+                        close_reason = "stop_loss"
+                    elif position['side'] == 'SELL' and current_price > entry_price:
+                        # Для SELL тейк-профит должен быть ниже входа
+                        self.logger.warning(
+                            f"⚠️ Несоответствие: take_profit для SELL, но цена {current_price:.2f} > входа {entry_price:.2f}. "
+                            f"Меняем на stop_loss"
+                        )
+                        close_reason = "stop_loss"
+                
+                # Валидация current_price перед закрытием позиции
+                # Проверяем, что цена не слишком сильно отличается от stop_loss/take_profit
+                validated_price = current_price
+                entry_price = position.get('entry_price', 0)
+                
+                # Сначала проверяем базовую валидацию - цена не должна отличаться от entry более чем в 1.5 раза
+                if entry_price > 0:
+                    entry_ratio = current_price / entry_price if entry_price > 0 else 1.0
+                    # Более строгая проверка - не более чем в 1.3 раза
+                    if entry_ratio > 1.3 or entry_ratio < 0.77:
+                        self.logger.error(
+                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: current_price для позиции #{position['id']} некорректна: "
+                            f"entry=${entry_price:,.2f}, current=${current_price:,.2f}, ratio={entry_ratio:.2f}x, "
+                            f"stop_loss=${stop_loss:,.2f}, take_profit=${take_profit:,.2f}"
+                        )
+                        # Используем stop_loss или take_profit в зависимости от причины закрытия
+                        if close_reason == "stop_loss" and stop_loss:
+                            validated_price = stop_loss
+                            self.logger.warning(f"   🔧 Исправление: используем stop_loss=${validated_price:,.2f}")
+                        elif close_reason == "take_profit" and take_profit:
+                            validated_price = take_profit
+                            self.logger.warning(f"   🔧 Исправление: используем take_profit=${validated_price:,.2f}")
+                        else:
+                            # Если нет stop_loss/take_profit, используем entry_price (это крайний случай)
+                            validated_price = entry_price
+                            self.logger.warning(f"   🔧 Исправление: используем entry_price=${validated_price:,.2f}")
+                
+                # Дополнительная проверка относительно stop_loss/take_profit
+                if close_reason == "stop_loss" and stop_loss and validated_price == current_price:
+                    # Цена должна быть близка к stop_loss (не более чем в 1.2 раза)
+                    price_ratio = current_price / stop_loss if stop_loss > 0 else 1.0
+                    if price_ratio > 1.2 or price_ratio < 0.83:
+                        self.logger.error(
+                            f"❌ Некорректная current_price для stop_loss позиции #{position['id']}: "
+                            f"current=${current_price:,.2f}, stop_loss=${stop_loss:,.2f}, ratio={price_ratio:.2f}x"
+                        )
+                        validated_price = stop_loss
+                        self.logger.warning(f"   🔧 Исправление: используем stop_loss=${validated_price:,.2f}")
+                elif close_reason == "take_profit" and take_profit and validated_price == current_price:
+                    # Цена должна быть близка к take_profit (не более чем в 1.2 раза)
+                    price_ratio = current_price / take_profit if take_profit > 0 else 1.0
+                    if price_ratio > 1.2 or price_ratio < 0.83:
+                        self.logger.error(
+                            f"❌ Некорректная current_price для take_profit позиции #{position['id']}: "
+                            f"current=${current_price:,.2f}, take_profit=${take_profit:,.2f}, ratio={price_ratio:.2f}x"
+                        )
+                        validated_price = take_profit
+                        self.logger.warning(f"   🔧 Исправление: используем take_profit=${validated_price:,.2f}")
+                
+                # Логируем детали перед закрытием
+                if validated_price != current_price:
+                    self.logger.warning(
+                        f"🔧 Цена исправлена для позиции #{position['id']}: "
+                        f"original=${current_price:,.2f} → validated=${validated_price:,.2f}"
+                    )
+                
                 self.logger.info(
                     f"🎯 Условие {close_reason} сработало для позиции #{position['id']} "
-                    f"({symbol} @ ${current_price:.2f})"
+                    f"({symbol} @ ${validated_price:.2f})"
                 )
-                self._close_virtual_position(position, current_price, close_reason)
+                self._close_virtual_position(position, validated_price, close_reason)
 
     @log_performance(threshold_seconds=30.0)
     def get_trading_signal_with_logging(self, symbol: str, market_data: Dict) -> Dict:
@@ -722,6 +802,9 @@ class VirtualTradingBot:
         stop_loss, take_profit = self.calculate_stop_loss_take_profit(
             entry_price, "BUY")
 
+        # Получаем время для позиции (для бэктеста - время свечи, иначе текущее)
+        position_time = getattr(self, 'current_backtest_time', None)
+        
         # Создаем виртуальную позицию в БД с учетом комиссии
         position_id = self.db.add_virtual_position(
             symbol=symbol,
@@ -731,7 +814,8 @@ class VirtualTradingBot:
             leverage=self.leverage,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            entry_fee=entry_fee
+            entry_fee=entry_fee,
+            created_at=position_time
         )
 
         if position_id:
@@ -779,6 +863,13 @@ class VirtualTradingBot:
         stop_loss, take_profit = self.calculate_stop_loss_take_profit(
             entry_price, "SELL")
 
+        # Получаем время для позиции (для бэктеста - время свечи, иначе текущее)
+        position_time = getattr(self, 'current_backtest_time', None)
+        if position_time:
+            self.logger.debug(f"📅 Используем время бэктеста для создания SELL позиции: {position_time}")
+        else:
+            self.logger.debug(f"📅 Используем текущее время для создания SELL позиции (current_backtest_time отсутствует)")
+        
         # Создаем виртуальную позицию в БД с учетом комиссии
         position_id = self.db.add_virtual_position(
             symbol=symbol,
@@ -788,7 +879,8 @@ class VirtualTradingBot:
             leverage=self.leverage,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            entry_fee=entry_fee
+            entry_fee=entry_fee,
+            created_at=position_time
         )
 
         if position_id:
@@ -813,10 +905,73 @@ class VirtualTradingBot:
     def _close_virtual_position(self, position: Dict, base_exit_price: float, reason: str):
         """Закрытие виртуальной позиции с записью в БД"""
         try:
+            # КРИТИЧЕСКАЯ ВАЛИДАЦИЯ base_exit_price - проверяем, что цена не слишком сильно отличается от entry_price
+            entry_price = position.get('entry_price', 0)
+            stop_loss = position.get('stop_loss', 0)
+            take_profit = position.get('take_profit', 0)
+            
+            if entry_price > 0:
+                price_ratio = base_exit_price / entry_price if entry_price > 0 else 1.0
+                # Для нормальных условий цена выхода не должна отличаться более чем в 1.2 раза
+                if price_ratio > 1.2 or price_ratio < 0.83:
+                    self.logger.error(
+                        f"❌ КРИТИЧЕСКАЯ ОШИБКА: base_exit_price для позиции #{position['id']} некорректна: "
+                        f"entry=${entry_price:,.2f}, exit=${base_exit_price:,.2f}, ratio={price_ratio:.2f}x, reason={reason}"
+                    )
+                    # ВСЕГДА используем stop_loss или take_profit как правильную цену
+                    if reason == 'stop_loss' and stop_loss:
+                        original_price = base_exit_price
+                        base_exit_price = stop_loss
+                        self.logger.warning(
+                            f"   🔧 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: заменяем ${original_price:,.2f} на stop_loss=${base_exit_price:,.2f}"
+                        )
+                    elif reason == 'take_profit' and take_profit:
+                        original_price = base_exit_price
+                        base_exit_price = take_profit
+                        self.logger.warning(
+                            f"   🔧 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: заменяем ${original_price:,.2f} на take_profit=${base_exit_price:,.2f}"
+                        )
+                    else:
+                        # Если нет stop_loss/take_profit, используем entry_price (это крайний случай)
+                        original_price = base_exit_price
+                        base_exit_price = entry_price
+                        self.logger.warning(
+                            f"   🔧 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: заменяем ${original_price:,.2f} на entry_price=${base_exit_price:,.2f}"
+                        )
+            
             # Применяем slippage к цене выхода (инвертируем направление относительно открытия)
             # При закрытии BUY мы продаем (SELL), при закрытии SELL мы покупаем (BUY)
             close_side = 'SELL' if position['side'] == 'BUY' else 'BUY'
+            
+            # Логируем перед применением slippage
+            self.logger.debug(
+                f"🔍 Закрытие позиции #{position['id']}: base_exit_price=${base_exit_price:,.2f}, "
+                f"close_side={close_side}, slippage_percent={getattr(self, 'slippage_percent', 0)}%"
+            )
+            
             exit_price = self.apply_slippage(base_exit_price, close_side)
+            
+            # Дополнительная валидация exit_price после применения slippage
+            if entry_price > 0:
+                exit_ratio = exit_price / entry_price if entry_price > 0 else 1.0
+                # Более строгая проверка - не более чем в 1.3 раза
+                if exit_ratio > 1.3 or exit_ratio < 0.77:
+                    self.logger.error(
+                        f"❌ КРИТИЧЕСКАЯ ОШИБКА: exit_price после slippage некорректна для позиции #{position['id']}: "
+                        f"entry=${entry_price:,.2f}, base_exit=${base_exit_price:,.2f}, exit=${exit_price:,.2f}, ratio={exit_ratio:.2f}x"
+                    )
+                    # Используем base_exit_price без slippage если slippage дает некорректный результат
+                    exit_price = base_exit_price
+                    self.logger.warning(f"   🔧 ИСПРАВЛЕНИЕ: используем base_exit_price без slippage: ${exit_price:,.2f}")
+                    
+                    # Дополнительная проверка - если и base_exit_price некорректна, используем stop_loss/take_profit
+                    if exit_ratio > 1.3 or exit_ratio < 0.77:
+                        if reason == 'stop_loss' and position.get('stop_loss'):
+                            exit_price = position['stop_loss']
+                            self.logger.warning(f"   🔧 ИСПРАВЛЕНИЕ: используем stop_loss=${exit_price:,.2f}")
+                        elif reason == 'take_profit' and position.get('take_profit'):
+                            exit_price = position['take_profit']
+                            self.logger.warning(f"   🔧 ИСПРАВЛЕНИЕ: используем take_profit=${exit_price:,.2f}")
             
             # Рассчитываем комиссию выхода
             position_value = exit_price * position['size']
@@ -830,8 +985,15 @@ class VirtualTradingBot:
                 fee_percent = (exit_fee / position_value) * 100
                 self.logger.info(f"   💸 Комиссия выхода: ${exit_fee:.4f} ({fee_percent:.3f}%)")
             
+            # Получаем время закрытия (для бэктеста - время свечи, иначе текущее)
+            close_time = getattr(self, 'current_backtest_time', None)
+            if close_time:
+                self.logger.debug(f"📅 Используем время бэктеста для закрытия позиции: {close_time}")
+            else:
+                self.logger.debug(f"📅 Используем текущее время для закрытия позиции (current_backtest_time отсутствует)")
+            
             # Закрываем позицию в БД с учетом комиссий
-            self.db.close_virtual_position(position['id'], exit_price, reason, exit_fee)
+            self.db.close_virtual_position(position['id'], exit_price, reason, exit_fee, closed_at=close_time)
 
             self.logger.info(
                 f"✅ Виртуальная позиция #{position['id']} закрыта. Причина: {reason}")

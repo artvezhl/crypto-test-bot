@@ -61,6 +61,12 @@ class BacktestEngine(VirtualTradingBot):
         # ID текущего бэктеста в БД
         self.backtest_id: Optional[int] = None
         
+        # Время начала бэктеста (для фильтрации позиций после очистки)
+        self.backtest_start_time: Optional[datetime] = None
+        
+        # Символы текущего бэктеста (для фильтрации статистики)
+        self.backtest_symbols: List[str] = []
+        
         # Счетчики для прогресса
         self.total_candles = 0
         self.processed_candles = 0
@@ -108,10 +114,48 @@ class BacktestEngine(VirtualTradingBot):
             self.logger.info(f"📊 Символы: {', '.join(symbols)}")
             self.logger.info(f"⏱️  Таймфрейм: {interval} минут")
             
-            # Устанавливаем начальный баланс
+            # Сохраняем символы текущего бэктеста для фильтрации статистики
+            self.backtest_symbols = symbols
+            
+            # Шаг 0: Очистка старых виртуальных позиций перед новым бэктестом
+            # ВАЖНО: Очистка должна быть ПЕРВОЙ операцией, до любых других действий
+            # Это гарантирует, что каждый бэктест начинается с чистой базы данных
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info("🧹 ШАГ 0: Очистка старых виртуальных позиций")
+            self.logger.info("=" * 80)
+            
+            # Запоминаем время начала бэктеста ДО очистки
+            self.backtest_start_time = datetime.now()
+            
+            # Проверяем количество позиций до очистки
+            count_before_query = self.db._execute_query("SELECT COUNT(*) as count FROM virtual_positions")
+            count_before = count_before_query[0]['count'] if count_before_query else 0
+            self.logger.info(f"📊 Найдено позиций в БД перед очисткой: {count_before}")
+            
+            if not self.db.clear_virtual_positions():
+                self.logger.error("❌ Не удалось очистить старые позиции. Бэктест может показать некорректные результаты.")
+                return {}
+            
+            # Проверяем, что очистка действительно удалила все позиции
+            count_after_query = self.db._execute_query("SELECT COUNT(*) as count FROM virtual_positions")
+            count_after = count_after_query[0]['count'] if count_after_query else 0
+            if count_after > 0:
+                self.logger.warning(f"⚠️ ВНИМАНИЕ: После очистки осталось {count_after} позиций! Возможна проблема с очисткой.")
+            else:
+                self.logger.info(f"✅ База данных очищена успешно (было: {count_before}, стало: {count_after})")
+            self.logger.info("=" * 80 + "\n")
+            
+            # Устанавливаем начальный баланс ПОСЛЕ очистки
             if initial_balance:
                 self.initial_balance = initial_balance
                 self.current_balance = initial_balance
+            else:
+                # Сбрасываем баланс к начальному значению из настроек
+                self.current_balance = self.initial_balance
+            
+            # Сбрасываем трекеры баланса
+            self.highest_balance = self.initial_balance
+            self.lowest_balance = self.initial_balance
             
             self.logger.info(f"💰 Начальный баланс: ${self.initial_balance:.2f}")
             
@@ -256,6 +300,11 @@ class BacktestEngine(VirtualTradingBot):
                         # Обрабатываем свечу (аналогично _process_symbol в VirtualTradingBot)
                         self._process_historical_candle(symbol, candle)
                 
+                # ОПТИМИЗАЦИЯ: обновляем баланс локально для всех символов перед записью в историю
+                # Используем цены из свечей вместо запросов к API
+                # Важно: собираем нереализованный PnL по ВСЕМ символам одновременно
+                self._update_balance_for_backtest_fast_all_symbols(timestamp)
+                
                 # Записываем баланс в историю для расчета метрик
                 self.balance_history.append({
                     'timestamp': timestamp,
@@ -339,6 +388,16 @@ class BacktestEngine(VirtualTradingBot):
             candle: Данные свечи OHLCV
         """
         try:
+            # Обновляем индекс текущей свечи для использования в стратегии
+            if symbol in self.historical_data:
+                candles = self.historical_data[symbol]
+                candle_timestamp = candle['timestamp']
+                # Находим индекс текущей свечи по timestamp
+                for idx, c in enumerate(candles):
+                    if c['timestamp'] == candle_timestamp:
+                        self.candle_indexes[symbol] = idx
+                        break
+            
             current_price = candle['close']
             
             # Обновляем цены виртуальных позиций
@@ -430,7 +489,7 @@ class BacktestEngine(VirtualTradingBot):
             if price_change > 0.5 and volume_ratio > 1.2:
                 confidence = min(0.75, 0.6 + (price_change / 10) + (volume_ratio - 1) * 0.1)
                 return {
-                    'action': 'long',
+                    'action': 'BUY',  # Используем BUY вместо long для совместимости
                     'confidence': confidence,
                     'reason': f'Momentum вверх: +{price_change:.2f}%, Vol: {volume_ratio:.2f}x'
                 }
@@ -439,7 +498,7 @@ class BacktestEngine(VirtualTradingBot):
             elif price_change < -0.5 and volume_ratio > 1.2:
                 confidence = min(0.75, 0.6 + (abs(price_change) / 10) + (volume_ratio - 1) * 0.1)
                 return {
-                    'action': 'short',
+                    'action': 'SELL',  # Используем SELL вместо short для совместимости
                     'confidence': confidence,
                     'reason': f'Momentum вниз: {price_change:.2f}%, Vol: {volume_ratio:.2f}x'
                 }
@@ -473,6 +532,90 @@ class BacktestEngine(VirtualTradingBot):
             self.logger.error(f"❌ Ошибка создания записи бэктеста: {e}")
             return None
     
+    def _get_backtest_stats(self) -> Dict:
+        """
+        Получает статистику виртуальной торговли для текущего бэктеста.
+        Учитывает ТОЛЬКО позиции для символов текущего бэктеста.
+        Поскольку мы очистили все позиции перед началом бэктеста (ШАГ 0),
+        все позиции в БД теперь созданы только в текущем бэктесте.
+        
+        Returns:
+            Dict: Статистика торговли
+        """
+        try:
+            # Фильтруем статистику только по символам текущего бэктеста
+            if not self.backtest_symbols:
+                self.logger.warning("⚠️ Не указаны символы бэктеста для фильтрации статистики")
+                return {}
+            
+            # Создаем условие WHERE для фильтрации по символам
+            if self.db.db_type == 'postgresql':
+                placeholders = ','.join(['%s'] * len(self.backtest_symbols))
+                where_clause = f"WHERE symbol IN ({placeholders})"
+            else:
+                placeholders = ','.join(['?'] * len(self.backtest_symbols))
+                where_clause = f"WHERE symbol IN ({placeholders})"
+            
+            if self.db.db_type == 'postgresql':
+                query = f"""
+                SELECT 
+                    COUNT(*) as total_trades,
+                    COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
+                    COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
+                    COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+                    COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    COALESCE(SUM(total_fees), 0) as total_fees_paid,
+                    COALESCE(SUM(entry_fee), 0) as total_entry_fees,
+                    COALESCE(SUM(exit_fee), 0) as total_exit_fees,
+                    AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN realized_pnl END), 0) as total_profit,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN ABS(realized_pnl) END), 0) as total_loss
+                FROM virtual_positions
+                {where_clause}
+                """
+            else:
+                query = f"""
+                SELECT 
+                    COUNT(*) as total_trades,
+                    COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
+                    COUNT(CASE WHEN status = 'open' THEN 1 END) as open_trades,
+                    COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+                    COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+                    COALESCE(SUM(total_fees), 0) as total_fees_paid,
+                    COALESCE(SUM(entry_fee), 0) as total_entry_fees,
+                    COALESCE(SUM(exit_fee), 0) as total_exit_fees,
+                    AVG(CASE WHEN status = 'closed' THEN pnl_percent END) as avg_pnl_percent,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN 1 END) as winning_trades,
+                    COUNT(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN 1 END) as losing_trades,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl > 0 THEN realized_pnl END), 0) as total_profit,
+                    COALESCE(SUM(CASE WHEN status = 'closed' AND realized_pnl < 0 THEN ABS(realized_pnl) END), 0) as total_loss
+                FROM virtual_positions
+                {where_clause}
+                """
+            
+            # Выполняем запрос с параметрами символов
+            self.logger.info(f"📊 Подсчет статистики для символов: {self.backtest_symbols}")
+            result = self.db._execute_query(query, tuple(self.backtest_symbols))
+            if result and len(result) > 0:
+                stats = self.db._convert_row(result[0])
+                self.logger.info(
+                    f"📊 Статистика для символов {self.backtest_symbols}: "
+                    f"{stats.get('total_trades', 0)} сделок, "
+                    f"{stats.get('winning_trades', 0)} прибыльных, "
+                    f"{stats.get('losing_trades', 0)} убыточных"
+                )
+                return stats
+            else:
+                self.logger.warning(f"⚠️ Не удалось получить статистику для символов {self.backtest_symbols}")
+                return {}
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка получения статистики бэктеста: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
     def _calculate_results(self) -> Dict:
         """
         Рассчитывает результаты бэктеста.
@@ -481,11 +624,45 @@ class BacktestEngine(VirtualTradingBot):
             Dict: Словарь с метриками
         """
         try:
-            # Получаем статистику виртуальной торговли
-            stats = self.get_virtual_stats()
+            # ВАЖНО: Получаем статистику ТОЛЬКО для символов текущего бэктеста
+            # Поскольку мы очистили все позиции перед началом бэктеста (ШАГ 0),
+            # все позиции в БД теперь созданы только в этом бэктесте
+            # Фильтруем по символам, чтобы учитывать только позиции для символов текущего бэктеста
+            stats_from_db = self._get_backtest_stats()  # Специальный метод для бэктеста (фильтрует по символам)
+            # Получаем открытые позиции только для символов текущего бэктеста
+            open_positions = []
+            for symbol in self.backtest_symbols:
+                symbol_positions = self.db.get_virtual_open_positions(symbol)
+                open_positions.extend(symbol_positions)
+            
+            # Формируем статистику вручную, чтобы быть уверенными в данных
+            stats = {
+                'initial_balance': self.initial_balance,
+                'current_balance': self.current_balance,
+                'total_realized_pnl': stats_from_db.get('total_realized_pnl', 0) or 0,
+                'total_unrealized_pnl': stats_from_db.get('total_unrealized_pnl', 0) or 0,
+                'total_trades': stats_from_db.get('total_trades', 0) or 0,
+                'closed_trades': stats_from_db.get('closed_trades', 0) or 0,
+                'open_positions': len(open_positions),
+                'winning_trades': stats_from_db.get('winning_trades', 0) or 0,
+                'losing_trades': stats_from_db.get('losing_trades', 0) or 0,
+                'avg_pnl_percent': stats_from_db.get('avg_pnl_percent', 0) or 0,
+                'total_fees_paid': stats_from_db.get('total_fees_paid', 0) or 0,
+                'total_entry_fees': stats_from_db.get('total_entry_fees', 0) or 0,
+                'total_exit_fees': stats_from_db.get('total_exit_fees', 0) or 0,
+                'total_profit': stats_from_db.get('total_profit', 0) or 0,
+                'total_loss': stats_from_db.get('total_loss', 0) or 0,
+                'highest_balance': self.highest_balance,
+                'lowest_balance': self.lowest_balance
+            }
+            
+            self.logger.debug(f"📊 Статистика для результатов: {stats['total_trades']} сделок, "
+                            f"{stats['winning_trades']} прибыльных, {stats['losing_trades']} убыточных")
             
             # Базовые метрики
-            total_pnl = stats.get('total_realized_pnl', 0) or 0
+            # ВАЖНО: используем текущий баланс для расчета PnL, а не только реализованный PnL
+            # Текущий баланс уже включает реализованный PnL + нереализованный PnL
+            total_pnl = self.current_balance - self.initial_balance
             total_trades = stats.get('total_trades', 0) or 0
             winning_trades = stats.get('winning_trades', 0) or 0
             losing_trades = stats.get('losing_trades', 0) or 0
@@ -497,6 +674,16 @@ class BacktestEngine(VirtualTradingBot):
             
             # Рассчитываем производные метрики
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            # ВАЖНО: обновляем баланс один последний раз перед расчетом результатов
+            # Это гарантирует, что финальный баланс включает все нереализованные PnL
+            if self.balance_history:
+                last_timestamp = self.balance_history[-1]['timestamp']
+                self._update_balance_for_backtest_fast_all_symbols(last_timestamp)
+            
+            # ВАЖНО: PnL рассчитывается из текущего баланса (включает реализованный + нереализованный)
+            # А не только из реализованного PnL из БД
+            total_pnl = self.current_balance - self.initial_balance
             roi = (total_pnl / self.initial_balance * 100) if self.initial_balance > 0 else 0
             
             results = {
@@ -721,6 +908,101 @@ class BacktestEngine(VirtualTradingBot):
         except Exception as e:
             self.logger.error(f"❌ Ошибка расчета Sortino Ratio: {e}")
             return 0.0
+    
+    def _update_balance_for_backtest_fast_all_symbols(self, timestamp: int):
+        """Оптимизированное обновление баланса для бэктеста (без API запросов) для всех символов"""
+        try:
+            # Получаем ВСЕ открытые позиции по всем символам
+            all_open_positions = self.db.get_virtual_open_positions()
+            
+            # Рассчитываем нереализованный PnL для всех позиций
+            total_unrealized_pnl = 0.0
+            
+            # Группируем позиции по символам для получения цен из свечей
+            positions_by_symbol = {}
+            for position in all_open_positions:
+                symbol = position['symbol']
+                if symbol not in positions_by_symbol:
+                    positions_by_symbol[symbol] = []
+                positions_by_symbol[symbol].append(position)
+            
+            # Для каждого символа получаем цену из свечи и рассчитываем PnL
+            for symbol, positions in positions_by_symbol.items():
+                # Получаем свечу для этого символа на текущем timestamp
+                candle = self._get_candle_at_timestamp(symbol, timestamp)
+                if not candle:
+                    # Если свечи нет, пропускаем этот символ (не должно происходить в нормальном бэктесте)
+                    self.logger.warning(f"⚠️ Свеча не найдена для {symbol} на timestamp {timestamp}")
+                    continue
+                
+                current_price = candle['close']
+                
+                # Рассчитываем PnL для всех позиций этого символа
+                # ВАЖНО: position['size'] - это количество монет, а не стоимость позиции
+                # PnL рассчитывается как разница цен * количество монет
+                # Леверидж уже учтен в размере позиции при открытии
+                for position in positions:
+                    leverage = position.get('leverage', 1)
+                    if position['side'] == 'BUY':
+                        # Для BUY: прибыль при росте цены
+                        pnl = (current_price - position['entry_price']) * position['size']
+                    else:  # SELL
+                        # Для SELL: прибыль при падении цены
+                        pnl = (position['entry_price'] - current_price) * position['size']
+                    total_unrealized_pnl += pnl
+                    
+                    # Логируем для отладки (только первые несколько позиций)
+                    if len([p for p in all_open_positions if p['symbol'] == symbol]) <= 2:
+                        self.logger.debug(
+                            f"🔍 PnL для позиции #{position['id']} ({position['side']}): "
+                            f"entry=${position['entry_price']:.2f}, current=${current_price:.2f}, "
+                            f"size={position['size']:.6f}, pnl=${pnl:.2f}"
+                        )
+            
+            # Получаем реализованный PnL из БД (один раз для всех позиций)
+            stats = self.db.get_virtual_trade_stats(365)
+            total_realized_pnl = stats.get('total_realized_pnl', 0) or 0
+            
+            # Обновляем баланс (один раз для всех символов)
+            # ВАЖНО: баланс = начальный баланс + реализованный PnL + нереализованный PnL
+            # Реализованный PnL уже включает все закрытые позиции
+            # Нереализованный PnL - это текущая прибыль/убыток открытых позиций
+            new_balance = self.initial_balance + total_realized_pnl + total_unrealized_pnl
+            
+            # ЗАЩИТА: проверяем, что баланс не стал слишком отрицательным (признак ошибки)
+            if new_balance < -100000:
+                self.logger.error(
+                    f"❌ КРИТИЧЕСКАЯ ОШИБКА: баланс стал некорректным: ${new_balance:,.2f}\n"
+                    f"   initial_balance: ${self.initial_balance:,.2f}\n"
+                    f"   total_realized_pnl: ${total_realized_pnl:,.2f}\n"
+                    f"   total_unrealized_pnl: ${total_unrealized_pnl:,.2f}\n"
+                    f"   open_positions: {len(all_open_positions)}\n"
+                    f"   Позиции: {[(p['id'], p['side'], p['symbol'], p['size'], p['entry_price']) for p in all_open_positions[:5]]}"
+                )
+                # Не обновляем баланс, если он стал слишком отрицательным
+                # Это признак ошибки в расчете
+                return
+            
+            self.current_balance = new_balance
+            
+            # Логируем для отладки (только при значительных изменениях или проблемах)
+            if abs(total_unrealized_pnl) > 1000 or len(all_open_positions) > 3 or abs(new_balance - self.initial_balance) > 5000:
+                self.logger.info(
+                    f"💰 Обновление баланса: initial=${self.initial_balance:.2f}, "
+                    f"realized_pnl=${total_realized_pnl:.2f}, "
+                    f"unrealized_pnl=${total_unrealized_pnl:.2f}, "
+                    f"current_balance=${self.current_balance:.2f}, "
+                    f"open_positions={len(all_open_positions)}"
+                )
+            
+            # Обновляем максимальный и минимальный баланс
+            if self.current_balance > self.highest_balance:
+                self.highest_balance = self.current_balance
+            if self.current_balance < self.lowest_balance:
+                self.lowest_balance = self.current_balance
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обновления баланса в бэктесте: {e}")
     
     def _calculate_calmar_ratio(self) -> float:
         """
